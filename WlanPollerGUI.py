@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "CISCO WLAN POLLER GUI"
-APP_VERSION = "v5.0.2"
+APP_VERSION = "v5.0.3"
 try:
     from ApFlashVulnerableChecker import analyze_logs
 except ImportError as e:
@@ -396,18 +396,24 @@ class PollerWorker(QThread):
                 self.log.emit(f"[DEBUG] Parsed AP rows: {len(ap_rows)}")
                 self.log.emit(f"[DEBUG] AP list file path = {self.ap_list_file}")
                 engine.run_ap_poller(ap_rows, self.ap_device, self.ap_cmds)
+
                 summary.update({
                     "ap_total": len(ap_rows),
                     "ap_success": getattr(engine, "success", None),
                     "ap_failed": getattr(engine, "failed", None),
                     "data_dir": getattr(engine, "data_dir", ""),
-                    "workflow": ""  # 🔥 CRITICAL FIX
+                    "workflow": self.workflow
                 })
+
+                # 🔥 RUN FLASH VULNERABILITY CHECKER
+                if self.workflow == "AP Flash Checker" and analyze_logs:
+                    print("DEBUG: Running flash vulnerability check (AP Only)")
+                    vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
+                    summary["vulnerable_rows"] = vuln_rows
 
                 summary["end"] = datetime.now()
                 self.finished_ok.emit(summary)
                 return
-
             # --- WLC & AP ---
             if self.operation_type == "WLC & AP":
                 if self.wlc_cmds:
@@ -2215,7 +2221,10 @@ class MainWindow(QMainWindow):
                         pass
 
                 vuln_rows = summary.get("vulnerable_rows", [])
+                vuln_count = len(vuln_rows)
 
+                if hasattr(self, "run_log"):
+                    self.run_log.append(f"Total Vulnerable APs Detected: {vuln_count}")
                 if hasattr(self, "vuln_table"):
                     try:
                         for vr in vuln_rows:
