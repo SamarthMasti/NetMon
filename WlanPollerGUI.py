@@ -303,6 +303,7 @@ class PollerWorker(QThread):
             model_group: str,
             ap_device: str,
             ap_list_file: str = "",
+            ap_mode: str = "AP Custom Cmd List",
     ):
         super().__init__()
         self.operation_type = operation_type
@@ -314,7 +315,7 @@ class PollerWorker(QThread):
         self.model_group = model_group
         self.ap_device = ap_device
         self.ap_list_file = ap_list_file
-
+        self.ap_mode = ap_mode
     def run(self):
         engine = None
         try:
@@ -395,8 +396,8 @@ class PollerWorker(QThread):
 
                 self.log.emit(f"[DEBUG] Parsed AP rows: {len(ap_rows)}")
                 self.log.emit(f"[DEBUG] AP list file path = {self.ap_list_file}")
-                engine.run_ap_poller(ap_rows, self.ap_device, self.ap_cmds)
-
+                engine.run_ap_poller(ap_rows, self.ap_device, self.ap_cmds, ap_mode=self.ap_mode)
+                self.log.emit("===== IMAGE DOWNLOAD PROCESS COMPLETED =====")
                 summary.update({
                     "ap_total": len(ap_rows),
                     "ap_success": getattr(engine, "success", None),
@@ -405,12 +406,30 @@ class PollerWorker(QThread):
                     "workflow": self.workflow
                 })
 
-                # 🔥 RUN FLASH VULNERABILITY CHECKER
+                # AP COUNT SUMMARY
+                self.log.emit("")
+                self.log.emit("=" * 56)
+                self.log.emit("  AP COUNT SUMMARY")
+                self.log.emit("=" * 56)
+                self.log.emit(f"  Total APs in file   : {len(ap_rows)}")
+                self.log.emit(f"  APs processed       : {len(ap_rows)}")
+                self.log.emit(f"  Success             : {engine.success}")
+                self.log.emit(f"  Failed              : {engine.failed}")
+                self.log.emit("=" * 56)
+
+                # THEN vulnerability analysis
                 if self.workflow == "AP Flash Checker" and analyze_logs:
-                    print("DEBUG: Running flash vulnerability check (AP Only)")
+                    self.log.emit("")
+                    self.log.emit("=" * 56)
+                    self.log.emit("  RUNNING FLASH VULNERABILITY ANALYSIS...")
+                    self.log.emit("  Please wait — scanning AP output logs.")
+                    self.log.emit("=" * 56)
+                    self.progress.emit(0)
                     vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
                     summary["vulnerable_rows"] = vuln_rows
-
+                    self.log.emit(f"  Vulnerability scan complete. Found: {len(vuln_rows)} vulnerable AP(s)")
+                    self.log.emit("=" * 56)
+                    self.progress.emit(100)
                 summary["end"] = datetime.now()
                 self.finished_ok.emit(summary)
                 return
@@ -457,8 +476,18 @@ class PollerWorker(QThread):
                     })
 
                 if self.workflow == "AP Flash Checker" and analyze_logs:
+                    self.log.emit("")
+                    self.log.emit("=" * 56)
+                    self.log.emit("  RUNNING FLASH VULNERABILITY ANALYSIS...")
+                    self.log.emit("  Please wait — scanning AP output logs.")
+                    self.log.emit("=" * 56)
+                    self.progress.emit(0)
                     vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
                     summary["vulnerable_rows"] = vuln_rows
+                    self.log.emit(f"  Vulnerability scan complete. Found: {len(vuln_rows)} vulnerable AP(s)")
+                    self.log.emit("=" * 56)
+                    self.progress.emit(100)
+
                 summary["end"] = datetime.now()
                 self.finished_ok.emit(summary)
                 return
@@ -743,6 +772,9 @@ class MainWindow(QMainWindow):
         self.ap_path = QLineEdit()
         self.ap_path.setReadOnly(True)
         ab.addWidget(self.ap_path)
+        self.ap_stats = QLabel("")
+        self.ap_stats.setStyleSheet("color:#374151; font-weight:600;")
+
 
         self.ap_browse = QPushButton("Browse")
         self.ap_browse.setProperty("class", "secondary")
@@ -750,6 +782,15 @@ class MainWindow(QMainWindow):
         ab.addWidget(self.ap_browse)
 
         c_l.addWidget(self.ap_upload_row)
+        self.ap_stats = QLabel("")
+        self.ap_stats.setAlignment(Qt.AlignLeft)
+
+        self.ap_stats.setStyleSheet("""
+        font-weight:600;
+        padding-top:4px;
+        """)
+
+        c_l.addWidget(self.ap_stats)
 
         # small breathing room inside the card (no large stretch)
         c_l.addSpacing(6)
@@ -915,71 +956,104 @@ class MainWindow(QMainWindow):
         return w
 
     def _page_step4(self) -> QWidget:
-        w = QWidget();
-        lay = QVBoxLayout(w);
+        w = QWidget()  # ← THIS LINE WAS MISSING
+        lay = QVBoxLayout(w)
         lay.setSpacing(8)
-        card = QGroupBox("Step4 - CLI Cmd List");
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setAlignment(Qt.AlignTop)  # ← ADD THIS
+        card = QGroupBox("Step4 - CLI Cmd List")
         card.setFont(FONT_CARD_TITLE)
-        c_l = QVBoxLayout(card);
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)  # ← ADD THIS
+        c_l = QVBoxLayout(card)
         c_l.setContentsMargins(12, 18, 12, 12)
+        c_l.setSpacing(10)
 
-        self.wlc_cmd_box = QTextEdit();
+        # ── WLC CMD BOX ──────────────────────────────────────
+        self.wlc_cmd_box = QTextEdit()
         self.wlc_cmd_box.setPlaceholderText("Enter WLC commands (one per line)")
-        c_l.addSpacing(10)
-        c_l.addWidget(QLabel("WLC Cmd List (shown when WLC involved)"));
+        self.wlc_cmd_box.setFixedHeight(120)
+        self.wlc_cmd_box.setAutoFillBackground(True)
+        self.wlc_cmd_box.setStyleSheet(
+            "QTextEdit { background-color: #ffffff !important; border: 1px solid #e6e8eb; border-radius: 6px; padding: 6px; }")
+        c_l.addWidget(QLabel("WLC Cmd List (shown when WLC involved)"))
         c_l.addWidget(self.wlc_cmd_box)
 
-        # ---------- AP SECTION CONTAINER ----------
+        # ── AP SECTION ───────────────────────────────────────
         self.ap_cmd_section = QWidget()
         ap_section_layout = QVBoxLayout(self.ap_cmd_section)
         ap_section_layout.setContentsMargins(0, 0, 0, 0)
+        ap_section_layout.setSpacing(8)
 
+        # Mode row
         ap_mode_row = QHBoxLayout()
-        ap_mode_row.addWidget(QLabel("Enter AP Details"))
-
+        ap_mode_row.addWidget(QLabel("AP Mode:"))
         self.ap_mode_dd = QComboBox()
         self.ap_mode_dd.addItems(["AP Custom Cmd List", "AP Image Download"])
         self.ap_mode_dd.currentTextChanged.connect(self._on_ap_mode_changed)
-
         ap_mode_row.addWidget(self.ap_mode_dd)
         ap_mode_row.addStretch()
         ap_section_layout.addLayout(ap_mode_row)
-        # ---------------- AP COMMAND BOX ----------------
-        self.ap_cmd_box = QTextEdit()
-        self.ap_cmd_box.setPlaceholderText("Enter AP commands (one per line)")
-        ap_section_layout.addWidget(self.ap_cmd_box)
-        # ---------------- FTP GROUP ----------------
-        self.ftp_group = QGroupBox("AP Image Download - TFTP ONLY")
-        self.ftp_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
+        # ── AP CUSTOM CMD BOX (shown for Custom CLI only) ────
+        self.ap_cmd_box = QTextEdit()
+        self.ap_cmd_box.setPlaceholderText("Enter AP CLI commands (one per line)")
+        self.ap_cmd_box.setFixedHeight(180)
+        self.ap_cmd_box.setStyleSheet(
+            "QTextEdit { background: #ffffff; border: 1px solid #e6e8eb; border-radius: 6px; }")
+        ap_section_layout.addWidget(self.ap_cmd_box)
+
+        # ── IMAGE DOWNLOAD SETTINGS (shown for Image Download only) ──
+        self.ftp_group = QGroupBox("AP Image Download Settings")
+        self.ftp_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         ftp_layout = QFormLayout()
+        ftp_layout.setSpacing(10)
         self.ftp_group.setLayout(ftp_layout)
 
+        # Protocol row
+        self.proto_dd = QComboBox()
+        self.proto_dd.addItems(["TFTP", "SFTP"])
+        self.proto_dd.setFixedHeight(30)
+        self.proto_dd.currentTextChanged.connect(self._on_proto_changed)
+        ftp_layout.addRow("Protocol:", self.proto_dd)
+
+        # SFTP credentials — hidden by default, shown only for SFTP
+        self.ftp_user_label = QLabel("SFTP Username:")
+        self.ftp_user = QLineEdit()
+        self.ftp_user.setPlaceholderText("SFTP username")
+        self.ftp_user.setFixedHeight(30)
+        self.ftp_user.setVisible(False)
+        self.ftp_user_label.setVisible(False)
+
+        self.ftp_pasw_label = QLabel("SFTP Password:")
+        self.ftp_pasw = QLineEdit()
+        self.ftp_pasw.setPlaceholderText("SFTP password")
+        self.ftp_pasw.setEchoMode(QLineEdit.Password)
+        self.ftp_pasw.setFixedHeight(30)
+        self.ftp_pasw.setVisible(False)
+        self.ftp_pasw_label.setVisible(False)
+
+        ftp_layout.addRow(self.ftp_user_label, self.ftp_user)
+        ftp_layout.addRow(self.ftp_pasw_label, self.ftp_pasw)
+
+        # stub these out so save/engine code doesn't crash
         self.ftp_addr = QLineEdit()
         self.ftp_path = QLineEdit()
-        self.ftp_user = QLineEdit()
-        self.ftp_pasw = QLineEdit()
-        self.ftp_pasw.setEchoMode(QLineEdit.Password)
-        self.scp_port = QLineEdit("22")
 
-        ftp_layout.addRow("FTP(SFTP)Username:", self.ftp_user)
-        ftp_layout.addRow("FTP(SFTP) Password:", self.ftp_pasw)
-
-        # Add ONCE only
+        self.ftp_group.setVisible(False)  # hidden until AP Image Download selected
         ap_section_layout.addWidget(self.ftp_group)
+
         c_l.addWidget(self.ap_cmd_section)
-        # ------------------------------------------
-
         lay.addWidget(card)
-        row = QHBoxLayout()
 
+        # ── BUTTONS ──────────────────────────────────────────
+        row = QHBoxLayout()
         back_btn = QPushButton("Back")
         back_btn.setProperty("nav", True)
         back_btn.clicked.connect(lambda: self._goto_step(2))
 
         save_btn = QPushButton("Save")
         save_btn.setProperty("nav", True)
-        save_btn.clicked.connect(self._step4_save)  # keep green
+        save_btn.clicked.connect(self._step4_save)
 
         proceed_btn = QPushButton("Proceed")
         proceed_btn.setProperty("nav", True)
@@ -989,8 +1063,9 @@ class MainWindow(QMainWindow):
         row.addWidget(save_btn)
         row.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
         row.addWidget(proceed_btn)
-
         lay.addLayout(row)
+
+        # apply initial state
         self._on_ap_mode_changed(self.ap_mode_dd.currentText())
         return w
 
@@ -1339,21 +1414,33 @@ class MainWindow(QMainWindow):
 
     def _on_operation_change(self, value: str):
         self.operation_type = value
+        if value != "AP Only":
+            self.ap_list_file = ""
+            self.ap_list_path = ""
+            if hasattr(self, "ap_path"):
+                self.ap_path.setText("")
         self._refresh_step1()
         self._refresh_visibility()
         self._update_step7_visibility()
-
     def _refresh_step1(self):
+
         is_ap_only = (self.operation_type == "AP Only")
+
         if hasattr(self, "ap_upload_row"):
             self.ap_upload_row.setVisible(is_ap_only)
+
+        # 🔴 CLEAR STATS WHEN NOT AP ONLY
+        if hasattr(self, "ap_stats"):
+            if not is_ap_only:
+                self.ap_stats.clear()
+
         if hasattr(self, "btn_step1_next"):
             if is_ap_only:
                 self.btn_step1_next.setEnabled(bool(self.ap_list_file) or bool(self.ap_list_path))
             else:
                 self.btn_step1_next.setEnabled(True)
-
     def _browse_ap_list(self):
+
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Upload AP List File (Format: AP Ip, AP Name)",
@@ -1361,26 +1448,74 @@ class MainWindow(QMainWindow):
             "Text/CSV (*.txt *.csv);;All Files (*.*)"
         )
 
-        if not path: return
+        if not path:
+            return
+
+        total_cnt = 0
+        valid_cnt = 0
+        invalid_cnt = 0
+        duplicate_cnt = 0
+
+        seen_ips = set()
+
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for i, line in enumerate(f, start=1):
+
                 s = line.strip()
-                if not s: continue
+                if not s:
+                    continue
+
+                total_cnt += 1
+
                 parts = [p.strip() for p in (s.split(",") if "," in s else s.split())]
                 ip = parts[0]
+
                 try:
                     socket.inet_pton(socket.AF_INET, ip)
+
+                    if ip in seen_ips:
+                        duplicate_cnt += 1
+                    else:
+                        valid_cnt += 1
+                        seen_ips.add(ip)
+
                 except Exception:
-                    QMessageBox.critical(self, "Invalid IP", f"Invalid IP address at line {i}: {ip}");
-                    return
+                    invalid_cnt += 1
+
+        if valid_cnt == 0:
+            QMessageBox.critical(self, "Invalid File", "No valid AP IP addresses found.")
+            return
+
         os.makedirs(CONFD, exist_ok=True)
 
         self.ap_list_file = path
         self.ap_path.setText(path)
         self.ap_list_path = path
-        QMessageBox.information(self, "AP List", f"Using file: {path}")
-        self._refresh_step1()
 
+        # -------- COLORED STATUS TEXT --------
+        stats_html = f"""
+        <span style='color:#2563eb; font-weight:600;'>Total:</span> {total_cnt} |
+        <span style='color:#16a34a; font-weight:600;'>Valid:</span> {valid_cnt} |
+        <span style='color:#dc2626; font-weight:600;'>Invalid:</span> {invalid_cnt} |
+        <span style='color:#f59e0b; font-weight:600;'>Duplicates:</span> {duplicate_cnt}
+        """
+
+        if hasattr(self, "ap_stats"):
+            self.ap_stats.setText(stats_html)
+
+        QMessageBox.information(
+            self,
+            "AP List Loaded",
+            f"""File loaded successfully.
+
+    Total APs: {total_cnt}
+    Valid APs: {valid_cnt}
+    Invalid APs: {invalid_cnt}
+    Duplicate APs: {duplicate_cnt}
+    """
+        )
+
+        self._refresh_step1()
     def _save_creds(self):
         if self.operation_type in ("WLC Only", "WLC & AP"):
             wlc_ip = self.wlc_ip.text().strip()
@@ -1485,7 +1620,7 @@ class MainWindow(QMainWindow):
             self._save_creds_silent()
         except Exception:
             pass
-
+        self.ap_name_map = {}
         # Reset UI defensively
         for attr, op in (
                 ("run_log", lambda w: w.clear()),
@@ -1494,14 +1629,26 @@ class MainWindow(QMainWindow):
                 ("progress", lambda w: w.setValue(0)),
                 ("results_summary", lambda w: w.clear()),
         ):
+
             if hasattr(self, attr):
                 try:
                     op(getattr(self, attr))
                 except Exception:
                     pass
-
+        # Disconnect old worker signals before creating new one
+        if hasattr(self, "worker") and self.worker is not None:
+            try:
+                self.worker.log.disconnect()
+                self.worker.progress.disconnect()
+                self.worker.ap_update.disconnect()
+                self.worker.finished_ok.disconnect()
+                self.worker.failed.disconnect()
+            except Exception:
+                pass
+            self.worker = None
         # Decide ap_list_file and ap_cmds
         ap_list_file = getattr(self, "ap_list_file", "")
+
 
         if self.operation_type != "AP Only":
             ap_list_file = ""
@@ -1519,6 +1666,7 @@ class MainWindow(QMainWindow):
         else:
             ap_cmds = getattr(self, "ap_cmds", [])
 
+
             print("DEBUG FINAL AP CMDS:")
             for c in ap_cmds:
                 print(c)
@@ -1534,6 +1682,7 @@ class MainWindow(QMainWindow):
                 model_group=getattr(self, "model_group", "All AP Models"),
                 ap_device=getattr(self, "ap_device", "cos_qca"),
                 ap_list_file=ap_list_file,
+                ap_mode=getattr(self, "ap_mode", "AP Custom Cmd List"),
             )
         except Exception as e:
             QMessageBox.critical(self, "Worker Error", f"Failed to create worker: {e}")
@@ -1671,6 +1820,16 @@ class MainWindow(QMainWindow):
                 lines = [l for l in f if l.strip()]
 
         try:
+            start_time = datetime.now().strftime("%H:%M:%S")
+
+            msg = f"""
+            ===== STARTING WLAN POLLER =====
+            Operation: {self.operation_type}
+            Workflow: {self.workflow}
+            Start Time: {start_time}
+            """
+
+            self.run_log.append(msg)
             self.worker.start()
             if hasattr(self, "run_log"):
                 self.run_log.append("[WORKER] start() called")
@@ -1703,6 +1862,7 @@ class MainWindow(QMainWindow):
 
         # AP Flash Checker -> set default AP cmds and skip Step4
         if wf == "AP Flash Checker":
+
             self.ap_cmds = [
                 "show clock",
                 "show version",
@@ -1712,10 +1872,19 @@ class MainWindow(QMainWindow):
                 "show filesystems",
                 "show image integrity",
             ]
-            # leave ap_mode as-is or default
+
             self.ap_mode = getattr(self, "ap_mode", "AP Custom Cmd List")
-            # skip Step4 and go to Step5 (Filters)
-            self._goto_step(4)
+
+            # ---- NEW LOGIC ----
+            if self.operation_type == "AP Only":
+                # Skip filters → go directly to preview
+                self.ap_filter_mode = "NONE"
+                self._fill_preview()
+                self._goto_step(5)  # Step6 Preview
+            else:
+                # WLC & AP still uses filters
+                self._goto_step(4)
+
             return
 
         # AP Image Download -> remember mode and skip Step4
@@ -1876,7 +2045,17 @@ class MainWindow(QMainWindow):
         # Update internal state so the rest of the GUI knows the saved lists
         self.wlc_cmds = wlc_cmds
         self.ap_cmds = ap_cmds
-
+        # Save SFTP credentials to INI so engine can read them
+        if hasattr(self, "proto_dd") and self.ini:
+            try:
+                self.ini.bulk_set("FTP", {
+                    "ftp_proto": self.proto_dd.currentText(),
+                    "ftp_user": self.ftp_user.text().strip() if hasattr(self, "ftp_user") else "",
+                    "ftp_pasw": self.ftp_pasw.text() if hasattr(self, "ftp_pasw") else "",
+                })
+                self.ini.save()
+            except Exception:
+                pass
         QMessageBox.information(self, "Saved", "Cmd lists (and FTP(SFTP) details if provided) saved under confd/")
 
     def _save_run_log(self):
@@ -1911,37 +2090,18 @@ class MainWindow(QMainWindow):
                 print("Unable to save run log:", e)
 
     def _on_ap_mode_changed(self, text: str):
-        """
-        Called when the AP Mode dropdown changes (Step4).
-        In TFTP-only mode, we simply persist the selection and
-        adjust placeholder text accordingly.
-        """
-
-        # Persist AP mode selection
         self.ap_mode = text
+        is_image = (text == "AP Image Download")
 
-        # If AP Image Download is selected, show TFTP-only guidance
-        if text == "AP Image Download" and hasattr(self, "ap_cmd_box"):
-            try:
-                self.ap_cmd_box.setPlaceholderText(
-                    "TFTP ONLY MODE\n\n"
-                    "Enter archive download-sw command using TFTP.\n\n"
-                    "Example:\n"
-                    "archive download-sw /no-reload "
-                    "tftp://<server-ip>/<image-file.tar>"
-                )
-            except Exception:
-                pass
-        else:
-            # Default placeholder for normal custom commands
-            if hasattr(self, "ap_cmd_box"):
-                try:
-                    self.ap_cmd_box.setPlaceholderText(
-                        "Enter AP CLI commands (one per line)"
-                    )
-                except Exception:
-                    pass
+        # cmd box always visible when AP is involved
+        if hasattr(self, "ap_cmd_box"):
+            self.ap_cmd_box.setVisible(True)
 
+        # ftp_group only visible when Image Download selected
+        if hasattr(self, "ftp_group"):
+            self.ftp_group.setVisible(is_image)
+
+        self._refresh_visibility()
     def _export_ap_table(self):
         """
         Export the AP Table to an Excel file under data/.
@@ -2113,7 +2273,24 @@ class MainWindow(QMainWindow):
     # ... (remaining methods: _step3_proceed, _on_ap_mode_changed, _step4_save, _step4_proceed, _enforce_one_filter,
     # _update_ap_device_from_model, _step5_preview are defined earlier in file - kept unchanged for brevity) ...
     # For completeness they are implemented above in the full content.
+    def _on_proto_changed(self, proto):
+        is_sftp = (proto == "SFTP")
 
+        # Server IP and Remote Path — only needed for SFTP
+        for attr in ("ftp_addr", "ftp_path", "ftp_user", "ftp_pasw",
+                     "ftp_user_label", "ftp_pasw_label"):
+            if hasattr(self, attr):
+                getattr(self, attr).setVisible(is_sftp)
+
+        # Also hide/show the form labels via the ftp_layout rows
+        if hasattr(self, "ftp_group") and self.ftp_group.layout():
+            lay = self.ftp_group.layout()
+            for i in range(lay.rowCount()):
+                label_item = lay.itemAt(i, QFormLayout.LabelRole)
+                if label_item and label_item.widget():
+                    txt = label_item.widget().text()
+                    if txt in ("Server IP:", "Remote Path:"):
+                        label_item.widget().setVisible(is_sftp)
     def _enforce_one_filter(self, _):
         if self.chk_site.isChecked() and self.chk_model.isChecked():
             sender = self.sender()
@@ -2400,7 +2577,9 @@ class MainWindow(QMainWindow):
 
         # finally mark run_in_progress false
         try:
+
             self.run_in_progress = False
+
         except Exception:
             pass
 
@@ -2535,6 +2714,7 @@ class MainWindow(QMainWindow):
                 lines.append("   AP:")
                 for c in ap_cmds:
                     lines.append(f"      • {c}")
+
 
         # ---------------- AP Filters ----------------
         lines.append("")
@@ -2719,13 +2899,10 @@ class MainWindow(QMainWindow):
             self.wlc_cmd_box.setVisible(show_wlc_cmd)
 
         show_ap_cmd = (
-                self.operation_type in ("AP Only", "WLC & AP")
-                or getattr(self, "workflow", "") == "AP Flash Checker"
-                or ap_mode_text == "AP Image Download"
-        )
+                              self.operation_type in ("AP Only", "WLC & AP")
+                      ) or getattr(self, "workflow", "") == "AP Flash Checker"
         if hasattr(self, "ap_cmd_box"):
             self.ap_cmd_box.setVisible(show_ap_cmd)
-
         # ---------------- FTP ----------------
         ftp_visible = (
                 self.operation_type in ("AP Only", "WLC & AP")
