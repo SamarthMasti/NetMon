@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from PollerEngine import PollerEngine
 from PollerEngine import decrypt_value, encrypt_value
 APP_NAME = "CISCO WLAN POLLER GUI"
-APP_VERSION = "v5.0.4"
+APP_VERSION = "v5.05"
 try:
     from ApFlashVulnerableChecker import analyze_logs
 except ImportError as e:
@@ -228,7 +228,45 @@ def is_ipv4_or_ipv6(addr: str) -> bool:
         return True
     except Exception:
         return False
+def normalize_ap_entry(parts):
+    """
+    Normalize AP entry into (ip, model, name)
+    Handles all cases safely.
+    """
 
+    ip = parts[0] if len(parts) >= 1 else ""
+    model = ""
+    name = ""
+
+    if len(parts) >= 3:
+        model = parts[1]
+        name = " ".join(parts[2:]).strip()
+
+    elif len(parts) == 2:
+        val = parts[1]
+
+        # Detect if it's a Cisco model (starts with C, AIR, CW etc.)
+        if re.match(r"^(C\d+|AIR-|CW)", val, re.IGNORECASE):
+            model = val
+            name = ""
+        else:
+            name = val
+            model = ""
+
+    # ---- Extract model from name if missing ----
+    if not model and name:
+        match = re.search(r"(C\d+\w*|AIR-[A-Z0-9-]+|CW\d+\w*)", name, re.IGNORECASE)
+        if match:
+            model = match.group(1)
+
+    # ---- Final fallbacks ----
+    if not name and ip:
+        name = f"AP_{ip.replace('.', '_')}"
+
+    if not model:
+        model = "UNKNOWN"
+
+    return ip, model, name
 
 import configparser
 from dataclasses import dataclass
@@ -389,24 +427,10 @@ class PollerWorker(QThread):
 
                         parts = [p.strip() for p in (s.split(",") if "," in s else s.split())]
 
-                        ip = parts[0] if len(parts) >= 1 else ""
-
-                        if len(parts) >= 3:
-                            model = parts[1]
-                            name = " ".join(parts[2:]).strip()
-                        elif len(parts) == 2:
-                            model = "UNKNOWN"
-                            name = parts[1]
-                        else:
-                            model = "UNKNOWN"
-                            name = ""
-
-                        if not name and ip:
-                            name = f"AP_{ip.replace('.', '_')}"
+                        ip, model, name = normalize_ap_entry(parts)
 
                         if ip:
                             ap_rows.append(ApRow(ip=ip, model=model, name=name))
-
                 if not ap_rows:
                     raise ValueError("AP list file is empty.")
 
@@ -1701,10 +1725,9 @@ class MainWindow(QMainWindow):
                         if not _s:
                             continue
                         _parts = [p.strip() for p in (_s.split(",") if "," in _s else _s.split())]
-                        _ip = _parts[0] if len(_parts) >= 1 else ""
-                        # 3-col: ip model name → name is parts[2]
-                        # 2-col: ip name      → name is parts[1]
-                        _name = _parts[2] if len(_parts) >= 3 else (_parts[1] if len(_parts) == 2 else "")
+
+                        _ip, _model, _name = normalize_ap_entry(_parts)
+
                         if _ip and _name:
                             self.ap_name_map[_ip] = _name
             except Exception:
@@ -2595,21 +2618,7 @@ class MainWindow(QMainWindow):
                                                 parts = [p.strip() for p in (s.split(",") if "," in s else s.split())]
 
                                                 # Basic defaults
-                                                ip = parts[0] if len(parts) >= 1 else ""
-                                                model = "-"
-                                                name = ""
-
-                                                # If line has 3+ tokens assume: ip model name
-                                                if len(parts) >= 3:
-                                                    ip = parts[0]
-                                                    model = parts[1]
-                                                    # name may contain spaces when comma-separated; join remainder for safety
-                                                    name = " ".join(parts[2:]).strip()
-                                                elif len(parts) == 2:
-                                                    # ambiguous two-column line — prefer CSV interpretation (ip,name),
-                                                    # otherwise treat second token as name and leave model unknown.
-                                                    name = parts[1]
-
+                                                ip, model, name = normalize_ap_entry(parts)
                                                 # Save mapping so later ap_update can use it
                                                 try:
                                                     if name:
@@ -2761,8 +2770,13 @@ class MainWindow(QMainWindow):
                 self.ap_table.insertRow(target_row)
 
             # Fallback name logic
-            if not name and hasattr(self, "ap_name_map"):
-                name = self.ap_name_map.get(ip, "")
+            if not name:
+                if hasattr(self, "ap_name_map"):
+                    name = self.ap_name_map.get(ip, "")
+
+            # FINAL fallback (your preferred format)
+            if not name and ip:
+                name = f"AP_{ip.replace('.', '_')}"
 
             self.ap_table.setItem(target_row, 0, QTableWidgetItem(name))
             # Prevent overwriting correct model with UNKNOWN

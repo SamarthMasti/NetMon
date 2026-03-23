@@ -801,7 +801,7 @@ class PollerEngine:
         return (False, cmd, False, 0)
     def _poll_one_ap(self, idx: int, ap: ApRow, device: str, cmds: List[str]):
         try:
-            self._log(f"[AP] ({idx+1}) Connecting {ap.ip} ({ap.name}) ...")
+            self._log(f"[AP] ({idx+1}) Connecting {ap.ip} ({ap.name}) {ap.model} ...")
             if not ssh_port_open(ap.ip, timeout=5):
                 self._log(f"[AP] {ap.ip} SSH check slow, trying anyway...")
             params = self._ap_connect_params(ap.ip, ap.model)
@@ -831,6 +831,9 @@ class PollerEngine:
             inv = self._ap_send_command(conn, "show inventory", read_timeout=120)
             sn_m = re.search(r"SN:\s*([A-Za-z0-9]+)", inv)
             sn = sn_m.group(1) if sn_m else "UNKNOWN"
+            pid_m = re.search(r"PID:\s*([A-Za-z0-9\-]+)", inv)
+            actual_model = pid_m.group(1).strip() if pid_m else ap.model
+            #print('DbgWpgui: Poll One AP : ',actual_model,pid_m.group(1))
 
             ver = self._ap_send_command(conn, "show version", read_timeout=120)
             img_m = re.search(r"AP Running Image\s*:\s*(.*)", ver)
@@ -903,7 +906,8 @@ class PollerEngine:
                 _safe_write_append(fname, out + "\n")
 
             conn.disconnect()
-            return idx, ap.ip, ap.model, "Success"
+
+            return idx, ap.ip, actual_model, "Success"
         except Exception as e:
             return idx, ap.ip, ap.model, f"Fail: {e}"
 
