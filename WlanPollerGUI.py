@@ -608,6 +608,7 @@ class MainWindow(QMainWindow):
         self.run_count = 0
         self.wlc_cmds: List[str] = []
         self.ap_cmds: List[str] = []
+        self.wlc_entries = []   # multi-WLC list
         if IniStore:
             self.ini = IniStore(CONFIG_FILE)
         else:
@@ -876,26 +877,27 @@ class MainWindow(QMainWindow):
         card_v.addSpacing(15)
         # ---------- WLC BLOCK ----------
         self.wlc_block = QWidget()
-        wlc_form = QFormLayout(self.wlc_block)
+        wlc_outer = QVBoxLayout(self.wlc_block)
+        wlc_outer.setContentsMargins(0, 0, 0, 0)
+        wlc_outer.setSpacing(6)
 
-        self.wlc_ip_label = QLabel("WLC IP Address")
-        self.wlc_ip = QLineEdit(self.ini.get("WLC", "wlc_ip") if self.ini else "")
-        self.wlc_ip.setFixedHeight(30)
+        wlc_header = QHBoxLayout()
+        wlc_header.addWidget(QLabel("WLC Configurations"))
+        self.btn_add_wlc = QPushButton("+ Add WLC")
+        self.btn_add_wlc.setFixedHeight(28)
+        self.btn_add_wlc.clicked.connect(self._add_wlc_entry)
+        wlc_header.addStretch()
+        wlc_header.addWidget(self.btn_add_wlc)
+        wlc_outer.addLayout(wlc_header)
 
-        self.wlc_user_label = QLabel("WLC Username")
-        self.wlc_user = QLineEdit(self.ini.get("WLC", "wlc_user") if self.ini else "")
-        self.wlc_user.setFixedHeight(30)
-
-        self.wlc_pass_label = QLabel("WLC Password")
-        self.wlc_pass = QLineEdit(self.ini.get("WLC", "wlc_pasw") if self.ini else "")
-        self.wlc_pass.setEchoMode(QLineEdit.Password)
-        self.wlc_pass.setFixedHeight(30)
-
-        wlc_form.addRow(self.wlc_ip_label, self.wlc_ip)
-        wlc_form.addRow(self.wlc_user_label, self.wlc_user)
-        wlc_form.addRow(self.wlc_pass_label, self.wlc_pass)
+        self.wlc_entries_widget = QWidget()
+        self.wlc_entries_layout = QVBoxLayout(self.wlc_entries_widget)
+        self.wlc_entries_layout.setContentsMargins(0, 0, 0, 0)
+        self.wlc_entries_layout.setSpacing(8)
+        wlc_outer.addWidget(self.wlc_entries_widget)
 
         card_v.addWidget(self.wlc_block)
+        self._add_wlc_entry()   # seed first entry
 
         # ---------- AP BLOCK ----------
         self.ap_block = QWidget()
@@ -1599,53 +1601,73 @@ class MainWindow(QMainWindow):
         self._refresh_step1()
     def _save_creds(self):
         if self.operation_type in ("WLC Only", "WLC & AP"):
-            wlc_ip = self.wlc_ip.text().strip()
-            if not is_ipv4_or_ipv6(wlc_ip):
-                QMessageBox.critical(self, "Invalid WLC IP", "Please enter a valid IPv4/IPv6 address for the WLC.");
-                return
+            for i, entry in enumerate(getattr(self, "wlc_entries", [])):
+                ip = entry["ip"].text().strip()
+                if not is_ipv4_or_ipv6(ip):
+                    QMessageBox.critical(self, "Invalid WLC IP", f"WLC {i+1}: invalid IP address.")
+                    return
         if not self.ini:
-            QMessageBox.warning(self, "Warning", "INI backend not available.");
+            QMessageBox.warning(self, "Warning", "INI backend not available.")
             return
         if self.operation_type in ("WLC Only", "WLC & AP"):
-            self.ini.bulk_set("WLC", {
-                "wlc_ip": self.wlc_ip.text().strip(),
-                "wlc_user": self.wlc_user.text().strip(),
-                "wlc_pasw": self.wlc_pass.text()
-            })
-        if self.operation_type in ("WLC & AP", "AP Only"):
-            self.ini.bulk_set("AP", {"ap_user": self.ap_user.text().strip(), "ap_pasw": self.ap_pass.text(),
-                                     "ap_enable": self.ap_enable.text()})
-        self.ini.save();
-        print("DbgWpgui: Save Func Written to file : ",CONFD)
+            if self.ini and getattr(self, "wlc_entries", []):
+
+                # CLEAR OLD SECTIONS
+                for sec in list(self.ini.cfg.sections()):
+                    if sec.startswith("WLC"):
+                        self.ini.cfg.remove_section(sec)
+
+                # WRITE NEW SECTIONS
+                for i, e in enumerate(self.wlc_entries):
+                    section = "WLC" if i == 0 else f"WLC{i+1}"
+
+                    self.ini.bulk_set(section, {
+                        "wlc_ip": e["ip"].text().strip(),
+                        "wlc_user": e["user"].text().strip(),
+                        "wlc_pasw": e["pasw"].text()
+                    })
+        self.ini.save()
+        print("DbgWpgui: Save Func Written to file : ", CONFD)
         print("DbgWpgui:Executable:", DATA_DIR)
         print("DbgWpgui:Base dir:", BASE_DIR)
-
         QMessageBox.information(self, "Saved", "Credentials saved to confd/config.ini")
-
+     
     def _save_creds_silent(self):
         if not self.ini:
             return
         if self.operation_type in ("WLC Only", "WLC & AP"):
             try:
-                self.ini.bulk_set("WLC",
-                                  {
-                                      "wlc_ip": self.wlc_ip.text().strip(),
-                                      "wlc_user": self.wlc_user.text().strip(),
-                                      "wlc_pasw": self.wlc_pass.text()
-                                  })
+                if getattr(self, "wlc_entries", []):
+                    # CLEAR OLD WLC SECTIONS (important to avoid stale entries)
+                    for sec in list(self.ini.cfg.sections()):
+                        if sec.startswith("WLC"):
+                            self.ini.cfg.remove_section(sec)
+
+                    # WRITE EACH WLC AS ITS OWN SECTION
+                    for i, e in enumerate(self.wlc_entries):
+
+                        section = "WLC" if i == 0 else f"WLC{i+1}"
+
+                        self.ini.bulk_set(section, {
+                            "wlc_ip": e["ip"].text().strip(),
+                            "wlc_user": e["user"].text().strip(),
+                            "wlc_pasw": e["pasw"].text()
+                        })
             except Exception:
                 pass
         if self.operation_type in ("WLC & AP", "AP Only"):
             try:
-                self.ini.bulk_set("AP", {"ap_user": self.ap_user.text().strip(), "ap_pasw": self.ap_pass.text(),
-                                         "ap_enable": self.ap_enable.text()})
+                self.ini.bulk_set("AP", {
+                    "ap_user": self.ap_user.text().strip(),
+                    "ap_pasw": self.ap_pass.text(),
+                    "ap_enable": self.ap_enable.text()
+                })
             except Exception:
                 pass
         try:
             self.ini.save()
         except Exception:
             pass
-
     def _on_worker_log(self, text):
         """Append worker log and touch last_progress_time so watchdog knows worker is alive."""
         try:
@@ -2495,7 +2517,7 @@ class MainWindow(QMainWindow):
             lines.append(f"Operation Type Selected in Step1: {summary.get('operation', '')}")
 
             if summary.get("operation") != "AP Only":
-                wlc_ip = self.wlc_ip.text().strip() if hasattr(self, "wlc_ip") else ""
+                wlc_ip = self.wlc_entries[0]["ip"].text().strip() if getattr(self, "wlc_entries", []) else ""
                 if wlc_ip:
                     lines.append(f"WLC IP address: {wlc_ip}")
 
@@ -2833,15 +2855,15 @@ class MainWindow(QMainWindow):
         op = getattr(self, "operation_type", "")
         lines.append(f"   - {op}")
 
-        if op != "AP Only" and hasattr(self, "wlc_ip"):
-            lines.append(f"   - WLC IP: {get_txt(self.wlc_ip)}")
+        if op != "AP Only" and getattr(self, "wlc_entries", []):
+            lines.append(f"   - WLC IP: {self.wlc_entries[0]['ip'].text().strip()}")
 
         # ---------------- Credentials ----------------
         lines.append("")
         section("Credentials")
 
-        if op != "AP Only" and hasattr(self, "wlc_user"):
-            lines.append(f"   - WLC Username: {get_txt(self.wlc_user)}")
+        if op != "AP Only" and getattr(self, "wlc_entries", []):
+            lines.append(f"   - WLC Username: {self.wlc_entries[0]['user'].text().strip()}")
 
         if op != "WLC Only" and hasattr(self, "ap_user"):
             lines.append(f"   - AP Username: {get_txt(self.ap_user)}")
@@ -3139,8 +3161,82 @@ class MainWindow(QMainWindow):
                     self.ap_table.resizeRowsToContents()
 
         super().changeEvent(event)
+    def _add_wlc_entry(self):
+        idx = len(self.wlc_entries)
 
+        entry_widget = QWidget()
+        entry_widget.setStyleSheet("background:#f9fafb; border:1px solid #e5e7eb; border-radius:6px;")
+        entry_layout = QVBoxLayout(entry_widget)
+        entry_layout.setContentsMargins(10, 8, 10, 8)
+        entry_layout.setSpacing(4)
 
+        # Header row: label + remove button
+        hdr = QHBoxLayout()
+        lbl = QLabel(f"WLC {idx + 1}")
+        lbl.setStyleSheet("font-weight:600;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
+
+        btn_remove = QPushButton("✕ Remove")
+        btn_remove.setFixedHeight(24)
+        btn_remove.setStyleSheet("min-width:60px; font-size:11px;")
+        btn_remove.clicked.connect(lambda _, ew=entry_widget: self._remove_wlc_entry(ew))
+        hdr.addWidget(btn_remove)
+        entry_layout.addLayout(hdr)
+
+        form = QFormLayout()
+        form.setSpacing(4)
+
+        ip_field = QLineEdit()
+        ip_field.setFixedHeight(28)
+        ip_field.setPlaceholderText("WLC IP")
+
+        user_field = QLineEdit()
+        user_field.setFixedHeight(28)
+        user_field.setPlaceholderText("Username")
+
+        pasw_field = QLineEdit()
+        pasw_field.setFixedHeight(28)
+        pasw_field.setEchoMode(QLineEdit.Password)
+        pasw_field.setPlaceholderText("Password")
+
+        # Pre-fill first entry from ini
+        # Pre-fill from ini — first entry uses [WLC], subsequent use [WLC2], [WLC3]...
+        if self.ini:
+            section = "WLC" if idx == 0 else f"WLC{idx+1}"
+
+            ip_field.setText(self.ini.get(section, "wlc_ip"))
+            user_field.setText(self.ini.get(section, "wlc_user"))
+            pasw_field.setText(self.ini.get(section, "wlc_pasw"))
+
+        form.addRow("IP:", ip_field)
+        form.addRow("User:", user_field)
+        form.addRow("Password:", pasw_field)
+        entry_layout.addLayout(form)
+
+        self.wlc_entries_layout.addWidget(entry_widget)
+        self.wlc_entries.append({
+            "widget": entry_widget,
+            "ip": ip_field,
+            "user": user_field,
+            "pasw": pasw_field,
+        })
+
+    def _remove_wlc_entry(self, entry_widget):
+        if len(self.wlc_entries) <= 1:
+            QMessageBox.warning(self, "Cannot Remove", "At least one WLC entry is required.")
+            return
+        self.wlc_entries = [e for e in self.wlc_entries if e["widget"] is not entry_widget]
+        entry_widget.setParent(None)
+        entry_widget.deleteLater()
+        # Renumber labels
+        for i, e in enumerate(self.wlc_entries):
+            lbl = e["widget"].findChild(QLabel)
+            if lbl:
+                lbl.setText(f"WLC {i + 1}")
+    
+
+    
 def resource_path(relpath: str) -> str:
     """
     Return a filesystem path to `relpath` that works when running normally
