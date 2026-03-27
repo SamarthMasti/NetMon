@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 print(">>> LOADED PollerEngine FROM:", __file__)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from netmiko import ConnectHandler
@@ -129,6 +130,7 @@ class ApRow:
     model: str
     name: str
     site_tag: str = ""
+    wlc_ip: str =""
 
 import base64
 
@@ -175,6 +177,7 @@ class IniStore:
       1) INI sections: [WLC], [AP], [FTP]
       2) Legacy 'key: value' flat file (auto-converted)
     """
+
     def __init__(self, path: str):
         self.path = path
         self.cfg = configparser.ConfigParser(interpolation=None)
@@ -235,7 +238,7 @@ class IniStore:
             "scp_port": legacy.get("scp_port", "22"),
         }
         self.save()
-
+    
     def _ensure_defaults(self):
         changed = False
         for sec in ["WLC", "AP", "FTP"]:
@@ -367,7 +370,7 @@ class PollerEngine:
         self,
         log_cb: Optional[Callable[[str], None]] = None,
         progress_cb: Optional[Callable[[int], None]] = None,
-        ap_update_cb: Optional[Callable[[int, str, str, str, str], None]] = None,
+        ap_update_cb: Optional[Callable[[int, str, str, str, str, str], None]] = None,
     ):
         CONFD.mkdir(parents=True, exist_ok=True)
         # ---------------- DATE + RUN BASED DATA DIRECTORY ----------------
@@ -422,7 +425,29 @@ class PollerEngine:
             self.log_cb(msg)
         else:
             print(msg)
+    def _process_single_wlc(self, section):
+        try:
+            self._log(f"[WLC] Connecting to {section}")
 
+            conn = self._wlc_connect(section)
+
+            out = conn.send_command("show ap summary", read_timeout=180)
+
+            conn.disconnect()
+
+            rows = WlcParse.parse_ap_summary(out)
+
+            # attach WLC info
+            for r in rows:
+                r.wlc_ip = self.ini.get(section, "wlc_ip")
+
+            self._log(f"[WLC] Completed {section} ({len(rows)} APs)")
+
+            return rows
+
+        except Exception as e:
+            self._log(f"[WLC ERROR] {section}: {e}")
+            return []
     def _progress(self, pct: int):
         if self.progress_cb:
             self.progress_cb(pct)
@@ -458,29 +483,24 @@ class PollerEngine:
         except Exception:
             pass
 
-    def _wlc_connect(self):
-        wlc_ip = self.ini.get("WLC", "wlc_ip")
-
+    def _wlc_connect(self, section: str = "WLC"):
+        wlc_ip = self.ini.get(section, "wlc_ip")
         if not wlc_ip:
-            raise ValueError("Missing WLC IP in config.ini ([WLC] wlc_ip)")
-
-        self._log(f"[WLC] Checking SSH port on {wlc_ip}...")
+            raise ValueError(f"Missing WLC IP in config.ini ([{section}] wlc_ip)")
+        self._log(f"[WLC] Checking SSH port on {wlc_ip} ({section})...")
         if not ssh_port_open(wlc_ip):
-            raise RuntimeError(f"WLC {wlc_ip} unreachable on port 22")
-
+            raise RuntimeError(f"WLC {wlc_ip} ({section}) unreachable on port 22")
         dev = {
             "device_type": "cisco_ios",
             "host": wlc_ip,
-            "username": self.ini.get("WLC", "wlc_user"),
-            "password": self.ini.get("WLC", "wlc_pasw"),
+            "username": self.ini.get(section, "wlc_user"),
+            "password": self.ini.get(section, "wlc_pasw"),
             "timeout": 60,
             "conn_timeout": 30,
             "banner_timeout": 30,
             "auth_timeout": 30,
         }
-
-        # ✅ Clean single message
-        self._log(f"[WLC] Connecting to {wlc_ip} ...")
+        self._log(f"[WLC] Connecting to {wlc_ip} ({section}) ...")
 
         conn = None
         try:
@@ -502,108 +522,259 @@ class PollerEngine:
             raise
 
     def run_wlc_cmds(self, wlc_cmds: List[str]) -> str:
-        conn = self._wlc_connect()
-        uptime_out = conn.send_command("show version | i uptime is", read_timeout=60)
-        wlc_host = WlcParse.wlc_hostname_from_uptime(uptime_out)
-
-        out_file = os.path.join(self.data_dir, f"{wlc_host}_outputs.txt")
-        header = (
-            f"<run timestamp='{datetime.now().isoformat()}' device='eWLC' hostname='{wlc_host}' "
-            f"model='eWLC-9800' version='None'>\n"
-        )
-        _safe_write_append(out_file, header)
-
-        total = len(wlc_cmds)
-        for i, cmd in enumerate(wlc_cmds, 1):
-            is_special, actual_cmd, needs_confirm, sleep_secs = self.SpecialCmdCheck(cmd)
-
-            # --- Handle sleep ---
-            if is_special and sleep_secs > 0:
-                self._log(f"[SLEEP] Waiting {sleep_secs}s before next command...")
-                _safe_write_append(out_file,
-                                   f"\n<cmd string='sleep_{sleep_secs}'>\n\t[SLEEP] {sleep_secs} seconds delay\n")
-                time.sleep(sleep_secs)
-                pct = int((i / total) * 100)
-                self._progress(pct)
-                continue
-
-            self._log(f"[WLC] Running: {actual_cmd}")
-            _safe_write_append(out_file, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
-
-            # --- Handle confirm command ---
-            if needs_confirm:
-                conn.write_channel(actual_cmd + "\n")
-                time.sleep(3)
-                conn.write_channel("y\n")
-                time.sleep(2)
-                out = conn.read_channel()
+        wlc_sections = self._get_wlc_sections()
+        last_out_file = ""
+        for section in wlc_sections:
+            self._log(f"[WLC] ===== Starting section [{section}] =====")
+            # Use per-WLC commands if stored, else fall back to shared commands
+            # Per-WLC override > shared fallback
+            cmds_section = f"{section}_CMDS"
+            effective_cmds = wlc_cmds   # default: shared list
+            if self.ini.cfg.has_section(cmds_section):
+                raw = self.ini.cfg.get(cmds_section, "cmds", fallback="").strip()
+                if raw:
+                    effective_cmds = [c.strip() for c in raw.splitlines() if c.strip()]
+                    self._log(f"[WLC] [{section}] using per-WLC override ({len(effective_cmds)} cmds)")
+                else:
+                    self._log(f"[WLC] [{section}] override empty — using shared cmd list ({len(effective_cmds)} cmds)")
             else:
-                out = conn.send_command(actual_cmd, read_timeout=120)
+                self._log(f"[WLC] [{section}] using shared cmd list ({len(effective_cmds)} cmds)")
+            try:
+                conn = self._wlc_connect(section)
+                
+                
+                
+                wlc_ip_val = self.ini.get(section, "wlc_ip")
+                safe_ip = wlc_ip_val.replace(".", "_")
 
-            _safe_write_append(out_file, out + "\n")
-            pct = int((i / total) * 100)
-            self._progress(pct)
-        conn.disconnect()
-        self._log(f"[WLC] Done. Output: {out_file}")
-        return out_file
+                # ✅ Define folder FIRST
+                wlc_folder = os.path.join(self.data_dir, f"WLC_{safe_ip}")
 
+                # ✅ Then create it
+                os.makedirs(wlc_folder, exist_ok=True)
+
+                # ✅ File name (constant)
+                out_file = os.path.join(wlc_folder, "wlc_outputs.txt")
+
+                # ✅ Header
+                header = (
+                    f"<run timestamp='{datetime.now().isoformat()}' "
+                    f"device='eWLC' hostname='{wlc_ip_val}' "
+                    f"model='eWLC-9800' version='None'>\n"
+                )
+                _safe_write_append(out_file, header)
+                total = len(effective_cmds)
+                for i, cmd in enumerate(effective_cmds, 1):
+                    is_special, actual_cmd, needs_confirm, sleep_secs = self.SpecialCmdCheck(cmd)
+                    if is_special and sleep_secs > 0:
+                        self._log(f"[SLEEP] Waiting {sleep_secs}s before next command...")
+                        _safe_write_append(out_file, f"\n<cmd string='sleep_{sleep_secs}'>\n\t[SLEEP] {sleep_secs} seconds delay\n")
+                        time.sleep(sleep_secs)
+                        pct = int((i / total) * 100)
+                        self._progress(pct)
+                        continue
+                    self._log(f"[WLC] Running: {actual_cmd}")
+                    _safe_write_append(out_file, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
+                    if needs_confirm:
+                        conn.write_channel(actual_cmd + "\n")
+                        time.sleep(3)
+                        conn.write_channel("y\n")
+                        time.sleep(2)
+                        out = conn.read_channel()
+                    else:
+                        out = conn.send_command(actual_cmd, read_timeout=120)
+                    _safe_write_append(out_file, out + "\n")
+                    pct = int((i / total) * 100)
+                    self._progress(pct)
+                conn.disconnect()
+                self._log(f"[WLC] Done [{section}]. Output: {out_file}")
+                last_out_file = out_file
+            except Exception as e:
+                self._log(f"[WLC] [{section}] failed: {e}")
+        return last_out_file
+    def run_client_auth_workflow(self):
+
+        delete_list = []
+
+        wlc_sections = self._get_wlc_sections()
+
+        for section in wlc_sections:
+
+            self._log(f"[AUTH] ===== WLC: {section} =====")
+
+            conn = self._wlc_connect(section)
+
+            # ---------------- STEP 1 ----------------
+            cmd1 = "show wireless client summary"
+            self._log(f"[AUTH][CMD] {cmd1}")
+
+            out1 = conn.send_command(cmd1)
+
+            self._log(f"[AUTH][RAW F1]\n{out1}")
+
+            f1 = self._extract_macs(out1)
+
+            self._log(f"[AUTH] F1 MACs: {f1}")
+
+            # ---------------- WAIT ----------------
+            self._log("[AUTH] Waiting 15 minutes...")
+            time.sleep(900)
+
+            # ---------------- STEP 2 ----------------
+            self._log(f"[AUTH][CMD] {cmd1}")
+
+            out2 = conn.send_command(cmd1)
+
+            self._log(f"[AUTH][RAW F2]\n{out2}")
+
+            f2 = self._extract_macs(out2)
+
+            self._log(f"[AUTH] F2 MACs: {f2}")
+
+            # ---------------- INTERSECTION ----------------
+            stuck = list(set(f1).intersection(set(f2)))
+
+            self._log(f"[AUTH] Persistent clients: {stuck}")
+
+            # ---------------- DETAIL CHECK ----------------
+            for mac in stuck:
+
+                cmd2 = f"show wireless client mac {mac} detail"
+                self._log(f"[AUTH][CMD] {cmd2}")
+
+                detail = conn.send_command(cmd2)
+
+                self._log(f"[AUTH][DETAIL]\n{detail}")
+
+                connected_for = self._extract_value(detail, "Connected For")
+                entry_time = self._extract_value(detail, "Client Entry Create Time")
+
+                self._log(f"[AUTH] {mac} → Connected: {connected_for}, Entry: {entry_time}")
+
+                if "Policy Manager State: Authenticating" not in detail:
+                    self._log(f"[AUTH][SKIP] {mac} not in Authenticating state")
+                    continue
+
+                if entry_time <= connected_for:
+                    self._log(f"[AUTH][SKIP] {mac} timing condition failed")
+                    continue
+
+                self._log(f"[AUTH][MARKED] {mac} added to delete list")
+                delete_list.append(mac)
+
+            conn.disconnect()
+
+        self._log(f"[AUTH] FINAL DELETE LIST: {delete_list}")
+
+        return delete_list
+    def _extract_macs(self, output):
+        macs = []
+        for line in output.splitlines():
+            match = re.search(r"([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})", line, re.I)
+            if match:
+                macs.append(match.group(1))
+        return macs
+
+
+    def _extract_value(self, text, key):
+        match = re.search(rf"{key}\s*:\s*(\d+)", text)
+        return int(match.group(1)) if match else 0
+    def deauth_clients(self, mac_list):
+
+        for section in self._get_wlc_sections():
+
+            conn = self._wlc_connect(section)
+
+            for mac in mac_list:
+                self._log(f"[AUTH] Deauth {mac}")
+                conn.send_command(f"wireless client mac-address {mac} deauthenticate")
+
+            conn.disconnect()
     def fetch_full_ap_list(self) -> List[ApRow]:
-        self._log("[WLC] fetch_full_ap_list() starting...")
-        self._log(f"[MODE CHECK] operation={self.operation} workflow={self.workflow}")
-        conn = self._wlc_connect()
-        out = conn.send_command("show ap summary", read_timeout=180)
-        conn.disconnect()
+        self._log("[WLC] Parallel fetch_full_ap_list() starting...")
 
-        rows = WlcParse.parse_ap_summary(out)
+        wlc_sections = self._get_wlc_sections()
+        all_rows: List[ApRow] = []
+        seen_ips = set()
 
-        # QCA Filter for AP Flash Checker workflow
+        max_threads = min(len(wlc_sections), 5)
+
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+
+            futures = {
+                executor.submit(self._process_single_wlc, sec): sec
+                for sec in wlc_sections
+            }
+
+            for future in as_completed(futures):
+                sec = futures[future]
+
+                try:
+                    rows = future.result()
+
+                    for r in rows:
+                        if r.ip not in seen_ips:
+                            all_rows.append(r)
+                            seen_ips.add(r.ip)
+
+                    self._log(f"[WLC] [{sec}] merged {len(rows)} APs")
+
+                except Exception as e:
+                    self._log(f"[WLC ERROR] {sec}: {e}")
+
+        self._log(f"[WLC] Total APs across all WLCs: {len(all_rows)}")
+        # 🔥 QCA FILTER FOR FLASH CHECKER
         if self.operation == "WLC & AP" and self.workflow == "AP Flash Checker":
+            self._log("[FILTER] Applying QCA model filter...")
+
             filtered = []
-            for r in rows:
+            for r in all_rows:
                 model_upper = r.model.upper()
                 if any(prefix in model_upper for prefix in QCA_PREFIXES):
                     filtered.append(r)
-            rows = filtered
+                else:
+                    self._log(f"[FILTER REMOVED] {r.name} ({r.model})")
 
-        all_path = os.path.join(CONFD, "ap_ip_list_all.txt")
+            all_rows = filtered
 
-        with open(all_path, "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(f"{r.ip} {r.model} {r.name}\n")
-
-        with open(os.path.join(self.data_dir, "ap_ip_list_all.txt"), "w", encoding="utf-8") as f:
-            for r in rows:
-                f.write(f"{r.ip} {r.model} {r.name}\n")
-
-        self._log(f"[WLC] Full AP list saved: {all_path} ({len(rows)} APs)")
-        return rows
+            self._log(f"[FILTER RESULT] {len(all_rows)} APs after filtering")
+        return all_rows
     def filter_by_site_tag(self, full_rows: List[ApRow], site_tag: str):
         self._log(f"[WLC] filter_by_site_tag('{site_tag}') starting...")
-        conn = self._wlc_connect()
-        tag_all = conn.send_command("show ap tag summary", read_timeout=180)
-        total = WlcParse.parse_total_ap_cnt_from_tag_summary(tag_all) or len(full_rows)
-        out = conn.send_command(f"show ap tag summary | inc {site_tag}", read_timeout=120)
-        conn.disconnect()
+        wlc_sections = self._get_wlc_sections()
+        total = 0
+        all_names = []
 
-        names = WlcParse.parse_ap_names_from_tag_summary(out, site_tag)
-        if not names:
+        for section in wlc_sections:
+            try:
+                conn = self._wlc_connect(section)
+                tag_all = conn.send_command("show ap tag summary", read_timeout=180)
+                total += WlcParse.parse_total_ap_cnt_from_tag_summary(tag_all) or 0
+                out = conn.send_command(f"show ap tag summary | inc {site_tag}", read_timeout=120)
+                conn.disconnect()
+                aplist_tag_path = os.path.join(self.data_dir, "aplist_tag.txt")
+                _safe_write_append(aplist_tag_path, out + "\n")
+                names = WlcParse.parse_ap_names_from_tag_summary(out, site_tag)
+                all_names.extend(names)
+            except Exception as e:
+                self._log(f"[WLC] [{section}] filter_by_site_tag failed: {e}")
+
+        total = total or len(full_rows)
+
+        if not all_names:
             if len(full_rows) == 0:
                 raise ValueError("WLC has no APs (show ap summary returned 0 rows).")
-            raise ValueError(f"'{site_tag}' Site Tag Name Does not exists")
-
-        aplist_tag_path = os.path.join(self.data_dir, "aplist_tag.txt")
-        _safe_write_append(aplist_tag_path, out + "\n")
+            raise ValueError(f"'{site_tag}' Site Tag Name Does not exist")
 
         name_map = {r.name: r for r in full_rows}
         selected: List[ApRow] = []
-        for n in names:
+        for n in all_names:
             if n in name_map:
                 rr = name_map[n]
                 rr.site_tag = site_tag
                 selected.append(rr)
 
         return selected, total
-
     def filter_by_model_group(self, full_rows: List[ApRow], model_group_label: str) -> List[ApRow]:
         if model_group_label == "All AP Models":
             return full_rows
@@ -739,9 +910,14 @@ class PollerEngine:
             # Detect archive/image completion OR failure
             if (
                     "archive done" in buf
+                    or "successful file transfer" in buf
                     or "archive download completed" in buf
                     or "image transfer complete" in buf
                     or "extracting images" in buf
+                    or "bundle for transfer" in buf
+                    or "bytes copied" in buf
+                    or "transfer complete" in buf
+                    or "upload complete" in buf
                     or "error" in buf
                     or "failed" in buf
                     or "fail" in buf
@@ -816,7 +992,7 @@ class PollerEngine:
                     time.sleep(3)
 
             if conn is None:
-                return idx, ap.ip, ap.model, "Fail: Connection retries exhausted"
+                return idx, ap.ip, ap.model, "Fail: Connection retries exhausted",ap.name,ap.wlc_ip
             self._open_sessions.append(conn)
             conn.enable()
             # Disable paging; some APs use non-standard "more" prompts.
@@ -845,7 +1021,13 @@ class PollerEngine:
                 if new_model and new_model.upper() != "UNKNOWN":
                     ap.model = new_model
 
-            fname = os.path.join(self.data_dir, f"{device}_{_safe_filename(ap.name)}.log")
+            if ap.wlc_ip:
+                safe_ip = ap.wlc_ip.replace(".", "_")
+                wlc_folder = os.path.join(self.data_dir, f"WLC_{safe_ip}")
+                os.makedirs(wlc_folder, exist_ok=True)
+            else:
+                wlc_folder = self.data_dir
+            fname = os.path.join(wlc_folder, f"{device}_{_safe_filename(ap.name)}.log")
             header = (
                 f"<run timestamp='{datetime.now().isoformat()}' device='{device}' hostname='{ap.name}' "
                 f"model='{ap.model}' version='{img}' Ip='{ap.ip}' SN='{sn}'>\n"
@@ -874,8 +1056,11 @@ class PollerEngine:
 
                 is_transfer_cmd = (
                         "sftp://" in cmd_lower
-
                         or "scp://" in cmd_lower
+                        or "copy syslogs" in cmd_lower
+                        or "copy core:" in cmd_lower
+                        or "copy crashinfo:" in cmd_lower
+                        or "copy support-bundle" in cmd_lower
                 )
 
                 if is_transfer_cmd:
@@ -907,9 +1092,9 @@ class PollerEngine:
 
             conn.disconnect()
 
-            return idx, ap.ip, actual_model, "Success"
+            return idx, ap.ip, actual_model, "Success", ap.name, ap.wlc_ip
         except Exception as e:
-            return idx, ap.ip, ap.model, f"Fail: {e}"
+           return idx, ap.ip, ap.model, f"Failed: {str(e)}", getattr(ap, "name", ""), getattr(ap, "wlc_ip", "")
 
     def run_ap_poller(self, ap_rows, device, ap_cmds, ap_mode="AP Custom Cmd List"):
         # Option A: user types the full command manually in the AP cmd box.
@@ -945,7 +1130,7 @@ class PollerEngine:
                     self._log("[AP] shutdown requested during polling; stopping result handling.")
                     break
                 try:
-                    idx, ip, model, status = fut.result()
+                    idx, ip, model, status, ap_name, wlc = fut.result()
                 except Exception as e:
                     self._log(f"[AP] task exception: {e}")
 
@@ -963,7 +1148,7 @@ class PollerEngine:
                     if idx is not None and self.ap_update_cb:
                         try:
                             ap_name = getattr(ap_rows[idx], "name", "")
-                            self.ap_update_cb(idx, ap_rows[idx].ip, ap_rows[idx].model, "Failed", ap_name)
+                            self.ap_update_cb(idx, ap_rows[idx].ip, ap_rows[idx].model, f"Failed: {str(e)}", ap_name, "")
                         except Exception:
                             pass
 
@@ -990,7 +1175,7 @@ class PollerEngine:
                 if self.ap_update_cb:
                     try:
                         # NEW: include ap_name as 5th argument
-                        self.ap_update_cb(idx, ip, model, status, ap_name)
+                        self.ap_update_cb(idx, ip, model, status, ap_name,wlc)
                     except Exception:
                         # ensure callbacks never kill the engine
                         pass
@@ -1020,4 +1205,28 @@ class PollerEngine:
             if sec == "WLC" or (sec.startswith("WLC") and sec[3:].isdigit()):
                 if self.ini.get(sec, "wlc_ip"):  # only include if IP is set
                     sections.append(sec)
-        return sorted(sections)
+
+        
+
+        # 🔒 Restrict to ONE WLC for WLC & AP
+        if self.operation == "WLC & AP":
+            return sections[:1]
+        def _sort_key(s):
+            return 0 if s == "WLC" else int(s[3:])
+        return sorted(sections, key=lambda s: 0 if s == "WLC" else int(s[3:]))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

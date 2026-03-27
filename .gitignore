@@ -28,3 +28,14 @@ Thumbs.db
 
 # Env
 .env
+# Runtime files
+confd/
+data/
+
+# Logs & outputs
+*.log
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc

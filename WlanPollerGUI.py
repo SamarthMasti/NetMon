@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 from PollerEngine import PollerEngine
 from PollerEngine import decrypt_value, encrypt_value
+from PySide6.QtGui import QColor
 APP_NAME = "CISCO WLAN POLLER GUI"
 APP_VERSION = "v5.05"
 try:
@@ -279,8 +280,9 @@ import sys
 import os
 
 
-class IniStore:
-    def __init__(self, path: str):
+from PollerEngine import IniStore
+'''
+def __init__(self, path: str):
         self.path = path
         self.cfg = configparser.ConfigParser(interpolation=None)
         if os.path.exists(path):
@@ -290,7 +292,7 @@ class IniStore:
             self.cfg.set("WLC", "wlc_ip", val)
             self.cfg.remove_option("WLC", "wlcipaddr")
 
-    def get(self, section: str, key: str, default: str = "") -> str:
+def get(self, section: str, key: str, default: str = "") -> str:
         val = self.cfg.get(section, key, fallback=default)
 
         if "pasw" in key.lower() or "password" in key.lower() or "enable" in key.lower():
@@ -298,29 +300,28 @@ class IniStore:
 
         return val
 
-    def bulk_set(self, section: str, data: dict):
+def bulk_set(self, section: str, data: dict):
         if not self.cfg.has_section(section):
             self.cfg.add_section(section)
-
         for k, v in data.items():
-
             if "pasw" in k.lower() or "password" in k.lower() or "enable" in k.lower():
-
-                v = encrypt_value(v)
-
+                if isinstance(v, str) and not v.startswith("ENC::"):
+                    v = encrypt_value(v)
             self.cfg.set(section, k, v)
 
-    def save(self):
+def save(self):
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             self.cfg.write(f)
 
-
+'''
 @dataclass
 class ApRow:
     ip: str
     model: str
     name: str
+    site_tag: str = ""
+    wlc_ip: str = ""
 
 
 # ---------------- Worker ----------------
@@ -328,7 +329,7 @@ class ApRow:
 class PollerWorker(QThread):
     progress = Signal(int)
     log = Signal(str)
-    ap_update = Signal(int, str, str, str, str)
+    ap_update = Signal(int, str, str, str, str,str)
     finished_ok = Signal(dict)
     failed = Signal(str)
 
@@ -338,8 +339,7 @@ class PollerWorker(QThread):
     def _engine_log(self, msg):
         self.log_sig.emit(str(msg))
 
-    def _engine_ap_update(self, idx, ip, model, status):
-        self.ap_update_sig.emit(idx, ip, model, status)
+
 
     def __init__(
             self,
@@ -374,7 +374,8 @@ class PollerWorker(QThread):
                 engine = PollerEngine(
                     log_cb=lambda msg: self.log.emit(msg),
                     progress_cb=lambda pct: self.progress.emit(pct),
-                    ap_update_cb=lambda i, ip, model, status, name: self.ap_update.emit(i, ip, model, status, name)
+                   ap_update_cb=lambda i, ip, model, status, name, wlc:
+                    self.ap_update.emit(i, ip, model, status, name, wlc)
                 )
                 engine.operation = self.operation_type
 
@@ -405,6 +406,35 @@ class PollerWorker(QThread):
 
             # --- WLC Only ---
             if self.operation_type == "WLC Only":
+
+                # 🔥 NEW WORKFLOW
+                if self.workflow == "Client Stuck In Auth Loop":
+
+                    delete_list = engine.run_client_auth_workflow()
+
+                    summary["delete_list"] = delete_list
+                    summary["clients_detected"] = len(delete_list)
+
+                    self.log.emit("")
+                    self.log.emit("=" * 50)
+                    self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
+                    self.log.emit("=" * 50)
+                    self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
+
+                    if delete_list:
+                        for mac in delete_list:
+                            self.log.emit(f" Deauthenticated: {mac}")
+                    else:
+                        self.log.emit(" No clients stuck in auth loop")
+
+                    self.log.emit("=" * 50)
+
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+                    return
+
+                # OLD FLOW
+                
                 if not self.wlc_cmds:
                     raise ValueError("WLC Cmd List is empty.")
 
@@ -594,7 +624,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._post_init_layout_fix)
 
     def _init_state(self):
-        self.operation_type = "WLC Only"
+        self.operation_type = "WLC & AP"
+        
         self.workflow = "Custom CLI Commands"
         self.ap_mode = "AP Custom Cmd List"
         self.ap_filter_mode = "NONE"
@@ -602,13 +633,11 @@ class MainWindow(QMainWindow):
         self.model_group = "All AP Models"
         self.ap_name_map = {}  # NEW: map ip -> ap name for AP Table first column
         self.ap_device = "cos_qca"
-        self.operation_type = "WLC & AP"
+        self.wlc_entries = []
         self.ap_list_file = ""
         self.ap_list_path = ""
         self.run_count = 0
-        self.wlc_cmds: List[str] = []
-        self.ap_cmds: List[str] = []
-        self.wlc_entries = []   # multi-WLC list
+        self.wlc_cmds: List[str] = []   # multi-WLC list
         if IniStore:
             self.ini = IniStore(CONFIG_FILE)
         else:
@@ -729,7 +758,7 @@ class MainWindow(QMainWindow):
             return
 
         event.accept()
-
+    
     def _inject_run_preview_into_log(self):
         """
         Inject Step6 preview block at top of Step7 Run Log.
@@ -765,7 +794,45 @@ class MainWindow(QMainWindow):
             self.run_log.append("\n".join(header_block))
         except Exception:
             pass
+    def _build_per_wlc_cmd_boxes(self):
 
+        layout = self.per_wlc_cmd_section.layout()
+
+        # clear old
+        for i in reversed(range(layout.count())):
+            item = layout.itemAt(i)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        self.per_wlc_cmd_boxes = {}
+
+        for i, entry in enumerate(self.wlc_entries):
+
+            ip = entry["ip"].text()
+
+            group = QGroupBox(f"WLC {i+1}")
+            g_layout = QVBoxLayout(group)
+
+            ip_label = QLabel(f"IP: {ip}")
+            ip_label.setStyleSheet("color:#6b7280; font-size:11px;")
+
+            cmd_box = QTextEdit()
+            cmd_box.setPlaceholderText("Enter commands (one per line)")
+            cmd_box.setFixedHeight(120)
+
+            g_layout.addWidget(ip_label)
+            g_layout.addWidget(cmd_box)
+
+            layout.addWidget(group)
+
+            self.per_wlc_cmd_boxes[f"WLC{i+1}"] = cmd_box
+
+            # load saved
+            if self.ini and self.ini.cfg.has_section(f"{section_name}_CMDS"):
+                raw = self.ini.cfg.get(f"{section_name}_CMDS", "cmds", fallback="")
+                cmd_box.setPlainText(raw)
+            
     # ---------------- Pages ----------------
     def _page_step1(self) -> QWidget:
         """
@@ -883,10 +950,19 @@ class MainWindow(QMainWindow):
 
         wlc_header = QHBoxLayout()
         wlc_header.addWidget(QLabel("WLC Configurations"))
-        self.btn_add_wlc = QPushButton("+ Add WLC")
+
+        # ➖ Remove WLC (NEW)
+        self.remove_btn_wlc = QPushButton("Remove WLC")
+        self.remove_btn_wlc.setFixedHeight(28)
+        self.remove_btn_wlc.clicked.connect(self._remove_last_wlc_entry)
+
+        # ➕ Add WLC
+        self.btn_add_wlc = QPushButton("Add WLC")
         self.btn_add_wlc.setFixedHeight(28)
         self.btn_add_wlc.clicked.connect(self._add_wlc_entry)
+
         wlc_header.addStretch()
+        wlc_header.addWidget(self.remove_btn_wlc)
         wlc_header.addWidget(self.btn_add_wlc)
         wlc_outer.addLayout(wlc_header)
 
@@ -943,6 +1019,7 @@ class MainWindow(QMainWindow):
         row.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum));
         row.addWidget(proceed_btn)
         lay.addLayout(row)
+        self._on_operation_change(self.operation_type)
         return w
 
     def _page_step3(self) -> QWidget:
@@ -966,11 +1043,59 @@ class MainWindow(QMainWindow):
 
         self.workflow_dd = QComboBox()
         # add items
-        self.workflow_dd.addItems(["AP Flash Checker", "Custom CLI Commands"])
+        self.workflow_dd.addItems([])
         self.workflow_dd.currentTextChanged.connect(self._on_workflow_change)
         self.workflow_dd.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.workflow_dd.setFixedHeight(30)
         c_l.addWidget(self.workflow_dd)
+
+        # ── UPLOAD FILES CONFIG (visible only when Upload workflow selected) ──
+        self.upload_config_widget = QWidget()
+        self.upload_config_widget.setStyleSheet(
+            "background:#f0f9ff; border:1px solid #bae6fd; border-radius:6px; padding:4px;"
+        )
+        upload_cfg_layout = QFormLayout(self.upload_config_widget)
+        upload_cfg_layout.setContentsMargins(12, 10, 12, 10)
+        upload_cfg_layout.setSpacing(8)
+
+        upload_title = QLabel("Upload Settings")
+        upload_title.setStyleSheet("font-weight:600; color:#0369a1; font-size:12px;")
+        upload_cfg_layout.addRow(upload_title)
+
+        self.upload_file_type_dd = QComboBox()
+        self.upload_file_type_dd.addItems(["SupportBundle"])
+        self.upload_file_type_dd.setFixedHeight(28)
+        upload_cfg_layout.addRow("File Type:", self.upload_file_type_dd)
+
+        self.upload_proto_dd = QComboBox()
+        self.upload_proto_dd.addItems(["TFTP", "SFTP"])
+        self.upload_proto_dd.setFixedHeight(28)
+        self.upload_proto_dd.currentTextChanged.connect(self._on_upload_proto_changed)
+        upload_cfg_layout.addRow("Protocol:", self.upload_proto_dd)
+
+        self.upload_server_ip_field = QLineEdit()
+        self.upload_server_ip_field.setPlaceholderText("Server IP  e.g. 192.168.0.10")
+        self.upload_server_ip_field.setFixedHeight(28)
+        upload_cfg_layout.addRow("Server IP:", self.upload_server_ip_field)
+
+        self.upload_sftp_user_label = QLabel("SFTP Username:")
+        self.upload_sftp_user = QLineEdit()
+        self.upload_sftp_user.setFixedHeight(28)
+        self.upload_sftp_user.setVisible(False)
+        self.upload_sftp_user_label.setVisible(False)
+
+        self.upload_sftp_pass_label = QLabel("SFTP Password:")
+        self.upload_sftp_pass = QLineEdit()
+        self.upload_sftp_pass.setEchoMode(QLineEdit.Password)
+        self.upload_sftp_pass.setFixedHeight(28)
+        self.upload_sftp_pass.setVisible(False)
+        self.upload_sftp_pass_label.setVisible(False)
+
+        upload_cfg_layout.addRow(self.upload_sftp_user_label, self.upload_sftp_user)
+        upload_cfg_layout.addRow(self.upload_sftp_pass_label, self.upload_sftp_pass)
+
+        self.upload_config_widget.setVisible(False)
+        c_l.addWidget(self.upload_config_widget)
 
         # small breathing room inside card (no big stretch)
         c_l.addSpacing(6)
@@ -996,7 +1121,7 @@ class MainWindow(QMainWindow):
         # Align the row the same way as in Step1/Step2: right-aligned
         # (we already added an expanding spacer before the back button)
         lay.addLayout(row)
-
+        QTimer.singleShot(0, self._update_workflow_dropdown)
         return w
 
     def _page_step4(self) -> QWidget:
@@ -1033,16 +1158,14 @@ class MainWindow(QMainWindow):
         self.wlc_cmd_box.setAutoFillBackground(True)
         self.wlc_cmd_box.setStyleSheet(
             "QTextEdit { background-color: #ffffff !important; border: 1px solid #e6e8eb; border-radius: 6px; padding: 6px; }")
-
+        self.wlc_cmd_label = QLabel("WLC Cmd List:")
+        self.wlc_cmd_label.setStyleSheet("font-weight:600;")
         self.wlc_cmd_section = QWidget()
         self.wlc_cmd_section.setStyleSheet("background: #ffffff;")
         self.wlc_cmd_section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         wlc_layout = QVBoxLayout(self.wlc_cmd_section)
         wlc_layout.setContentsMargins(0, 0, 0, 0)
         wlc_layout.setSpacing(6)
-
-        self.wlc_cmd_label = QLabel("WLC Cmd List")
-        self.wlc_cmd_label.setStyleSheet("font-weight:600;")
         wlc_layout.addWidget(self.wlc_cmd_label)
         wlc_layout.addWidget(self.wlc_cmd_box)
         c_l.addWidget(self.wlc_cmd_section)
@@ -1128,6 +1251,7 @@ class MainWindow(QMainWindow):
         back_btn = QPushButton("Back")
         back_btn.setProperty("nav", True)
         back_btn.clicked.connect(lambda: self._goto_step(2))
+        
 
         save_btn = QPushButton("Save")
         save_btn.setProperty("nav", True)
@@ -1145,6 +1269,8 @@ class MainWindow(QMainWindow):
 
         self._on_ap_mode_changed(self.ap_mode_dd.currentText())
         return outer
+    
+            
     def _page_step5(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -1256,7 +1382,7 @@ class MainWindow(QMainWindow):
 
         back = QPushButton("Back")
         back.setProperty("nav", True)
-        back.clicked.connect(lambda: self._goto_step(4 if self.operation_type != "WLC Only" else 3))
+        back.clicked.connect(lambda: self._goto_step(4))
 
         confirm = QPushButton("Confirm and Start WlanPoller")
         confirm.setProperty("nav", True)
@@ -1322,20 +1448,44 @@ class MainWindow(QMainWindow):
         ap_layout.setSpacing(4)
         ap_layout.addWidget(QLabel("AP Table"))
 
-        self.ap_table = QTableWidget(0, 4)
-        self.ap_table.setHorizontalHeaderLabels(["AP Name", "AP Model", "AP IP", "Status"])
+        # 🔥 ALWAYS recreate correct table structure
+        if self.operation_type == "AP Only":
+
+            self.ap_table = QTableWidget()
+            self.ap_table.setColumnCount(4)
+            self.ap_table.setHorizontalHeaderLabels([
+                "AP Name", "AP Model", "AP IP", "Status"
+            ])
+
+        else:
+
+            self.ap_table = QTableWidget()
+            self.ap_table.setColumnCount(5)
+            self.ap_table.setHorizontalHeaderLabels([
+                "WLC IP", "AP Name", "AP Model", "AP IP", "Status"
+            ])
         header = self.ap_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.Stretch)
-        self.ap_table.setColumnWidth(0, 220)
-        self.ap_table.setColumnWidth(1, 160)
-        self.ap_table.setColumnWidth(2, 160)
-        self.ap_table.setColumnWidth(3, 500)
+
+        # ✅ Proper resize logic
+        for i in range(self.ap_table.columnCount() - 1):
+            header.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+
+        header.setSectionResizeMode(self.ap_table.columnCount() - 1, QHeaderView.Stretch)
+        header.setSectionResizeMode(self.ap_table.columnCount() - 1, QHeaderView.Stretch)
+        if self.operation_type == "AP Only":
+            self.ap_table.setColumnWidth(0, 220)
+            self.ap_table.setColumnWidth(1, 160)
+            self.ap_table.setColumnWidth(2, 160)
+            self.ap_table.setColumnWidth(3, 500)
+        else:
+            self.ap_table.setColumnWidth(0, 160)  # WLC
+            self.ap_table.setColumnWidth(1, 220)
+            self.ap_table.setColumnWidth(2, 160)
+            self.ap_table.setColumnWidth(3, 160)
+            self.ap_table.setColumnWidth(4, 500)
         self.ap_table.verticalHeader().setVisible(False)
-        self.ap_table.setWordWrap(False)
-        self.ap_table.setTextElideMode(Qt.ElideRight)
+        self.ap_table.setWordWrap(True)
+        self.ap_table.setTextElideMode(Qt.ElideNone)
         self.ap_table.verticalHeader().setDefaultSectionSize(34)
         self.ap_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.ap_table.setAlternatingRowColors(True)
@@ -1497,14 +1647,44 @@ class MainWindow(QMainWindow):
 
     def _on_operation_change(self, value: str):
         self.operation_type = value
+
+        # --- Existing logic ---
         if value != "AP Only":
             self.ap_list_file = ""
             self.ap_list_path = ""
             if hasattr(self, "ap_path"):
                 self.ap_path.setText("")
+
+        # =========================================================
+        # 🔥 FIXED LOGIC
+        # =========================================================
+        if hasattr(self, "btn_add_wlc") and hasattr(self, "remove_btn_wlc"):
+
+            if value == "WLC Only":
+                # ✅ SHOW buttons
+                self.btn_add_wlc.setVisible(True)
+                self.remove_btn_wlc.setVisible(True)
+
+            else:
+                # ❌ HIDE for BOTH "WLC & AP" and "AP Only"
+                self.btn_add_wlc.setVisible(False)
+                self.remove_btn_wlc.setVisible(False)
+
+                # ✅ Force only ONE WLC
+                if hasattr(self, "wlc_entries"):
+                    while len(self.wlc_entries) > 1:
+                        entry = self.wlc_entries.pop()
+                        entry["widget"].deleteLater()
+        if hasattr(self, "wlc_block"):
+            self.wlc_block.setVisible(value != "AP Only")
+
+        if hasattr(self, "ap_block"):
+            self.ap_block.setVisible(value != "WLC Only")
+        # --- Existing calls ---
         self._refresh_step1()
         self._refresh_visibility()
         self._update_step7_visibility()
+        self._update_workflow_dropdown()
     def _refresh_step1(self):
 
         is_ap_only = (self.operation_type == "AP Only")
@@ -1603,35 +1783,57 @@ class MainWindow(QMainWindow):
         if self.operation_type in ("WLC Only", "WLC & AP"):
             for i, entry in enumerate(getattr(self, "wlc_entries", [])):
                 ip = entry["ip"].text().strip()
+                if not ip:
+                    continue
                 if not is_ipv4_or_ipv6(ip):
                     QMessageBox.critical(self, "Invalid WLC IP", f"WLC {i+1}: invalid IP address.")
                     return
+
         if not self.ini:
             QMessageBox.warning(self, "Warning", "INI backend not available.")
             return
+
         if self.operation_type in ("WLC Only", "WLC & AP"):
             if self.ini and getattr(self, "wlc_entries", []):
 
-                # CLEAR OLD SECTIONS
+                # CLEAR OLD WLC SECTIONS
                 for sec in list(self.ini.cfg.sections()):
                     if sec.startswith("WLC"):
                         self.ini.cfg.remove_section(sec)
 
-                # WRITE NEW SECTIONS
+                # WRITE NEW WLC SECTIONS
                 for i, e in enumerate(self.wlc_entries):
+
+                    ip = e["ip"].text().strip()
+                    if not ip:
+                        continue   # ✅ skip empty WLC rows
+
                     section = "WLC" if i == 0 else f"WLC{i+1}"
 
                     self.ini.bulk_set(section, {
-                        "wlc_ip": e["ip"].text().strip(),
+                        "wlc_ip": ip,
                         "wlc_user": e["user"].text().strip(),
-                        "wlc_pasw": e["pasw"].text()
+                        "wlc_pasw": e["pasw"].text().strip()   # ✅ FIXED KEY
                     })
+
+        # SAVE AP credentials
+        if self.operation_type in ("WLC & AP", "AP Only"):
+            try:
+                self.ini.bulk_set("AP", {
+                    "ap_user": self.ap_user.text().strip(),
+                    "ap_pasw": self.ap_pass.text().strip(),
+                    "ap_enable": self.ap_enable.text().strip()
+                })
+            except Exception:
+                pass
+
         self.ini.save()
+
         print("DbgWpgui: Save Func Written to file : ", CONFD)
         print("DbgWpgui:Executable:", DATA_DIR)
         print("DbgWpgui:Base dir:", BASE_DIR)
+
         QMessageBox.information(self, "Saved", "Credentials saved to confd/config.ini")
-     
     def _save_creds_silent(self):
         if not self.ini:
             return
@@ -1731,7 +1933,37 @@ class MainWindow(QMainWindow):
         Saves credentials silently, resets UI, builds the PollerWorker and starts it.
         """
         print('DbgWpgui: Inside Start_run..')
+        # 🔥 FORCE CORRECT TABLE STRUCTURE BEFORE RUN
 
+        if self.operation_type == "AP Only":
+
+            self.ap_table.setColumnCount(4)
+            self.ap_table.setHorizontalHeaderLabels([
+                "AP Name", "AP Model", "AP IP", "Status"
+            ])
+
+        else:
+
+            self.ap_table.setColumnCount(5)
+            self.ap_table.setHorizontalHeaderLabels([
+                "WLC IP", "AP Name", "AP Model", "AP IP", "Status"
+            ])
+
+        # 🔥 CLEAR OLD DATA
+        self.ap_table.setRowCount(0)
+        # Load shared WLC cmds (per-WLC overrides live in ini, read by engine)
+        # Load shared WLC cmds (per-WLC overrides live in ini, read by engine)
+        if hasattr(self, "wlc_cmd_box"):
+            self.wlc_cmds = [l.strip() for l in self.wlc_cmd_box.toPlainText().splitlines() if l.strip()]
+
+        # Load AP cmds — but NEVER overwrite if workflow already built them
+        # (Upload Files from AP and AP Flash Checker build cmds in _step3_proceed)
+        _workflows_that_prebuild_cmds = ("Upload Files from AP", "AP Flash Checker")
+        if getattr(self, "workflow", "") not in _workflows_that_prebuild_cmds:
+            if hasattr(self, "ap_cmd_box"):
+                box_cmds = [l.strip() for l in self.ap_cmd_box.toPlainText().splitlines() if l.strip()]
+                if box_cmds:
+                    self.ap_cmds = box_cmds
         # Silent save
         try:
             self._save_creds_silent()
@@ -1969,11 +2201,19 @@ class MainWindow(QMainWindow):
                 self.sidebar.setEnabled(True)
 
     def _step2_proceed(self):
-        if self.operation_type == "WLC Only":
-            self._goto_step(3)
-        else:
-            self._goto_step(2)
 
+        missing = self._validate_all_wlcs()
+
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Missing WLC Credentials",
+                f"Please fill credentials for:\n{', '.join(missing)}"
+            )
+            return  # 🚫 BLOCK navigation
+
+        # ✅ Only move if validation passed
+        self._goto_step(2)
     def _step3_proceed(self):
         """
         Proceed from Step3 (Workflow).
@@ -2024,9 +2264,62 @@ class MainWindow(QMainWindow):
             # ensure _refresh_visibility or Step5 shows them (we earlier discussed that).
             self._goto_step(4)
             return
+# AP Image Download -> remember mode and skip Step4
+        if wf == "AP Image Download":
+            self.ap_mode = "AP Image Download"
+            self._goto_step(4)
+            return
+
+        # Upload Files from AP -> validate, build commands, skip Step4
+        if wf == "Upload Files from AP":
+            server_ip = self.upload_server_ip_field.text().strip() if hasattr(self, "upload_server_ip_field") else ""
+
+            if not server_ip:
+                QMessageBox.critical(self, "Missing", "Enter the Server IP address for file upload.")
+                return
+
+            if not is_ipv4_or_ipv6(server_ip):
+                QMessageBox.critical(self, "Invalid IP", "Server IP is not a valid IPv4/IPv6 address.")
+                return
+
+            proto     = self.upload_proto_dd.currentText()     if hasattr(self, "upload_proto_dd")     else "TFTP"
+            file_type = self.upload_file_type_dd.currentText() if hasattr(self, "upload_file_type_dd") else "Syslogs"
+
+            if proto == "SFTP":
+                sftp_user = getattr(self, "upload_sftp_user", None)
+                sftp_pass = getattr(self, "upload_sftp_pass", None)
+                if not (sftp_user and sftp_user.text().strip()):
+                    QMessageBox.critical(self, "Missing", "Enter SFTP username.")
+                    return
+                if not (sftp_pass and sftp_pass.text()):
+                    QMessageBox.critical(self, "Missing", "Enter SFTP password.")
+                    return
+
+            # Auto-build the AP command — user never touches Step4 for this workflow
+            self.ap_cmds  = self._build_upload_cmds(file_type, proto, server_ip)
+            self.ap_mode  = "AP Custom Cmd List"
+
+            # Persist state for preview
+            self.upload_file_type   = file_type
+            self.upload_server_ip_val = server_ip
+            self.upload_proto       = proto
+
+            if self.operation_type == "AP Only":
+                # No filters needed — go straight to Preview
+                self.ap_filter_mode = "NONE"
+                self._fill_preview()
+                self._goto_step(5)
+            else:
+                # WLC & AP — still allow site/model filter
+                self._goto_step(4)
+            return
 
         # Default: Custom CLI Commands -> show Step4
-        self._goto_step(3)
+        if self.workflow == "Client Stuck In Auth Loop":
+            self._goto_step(5)   # skip Step4 → go to Step5
+        else:
+            self._goto_step(3)   # normal flow
+        
 
     def _step4_proceed(self):
         """
@@ -2124,111 +2417,143 @@ class MainWindow(QMainWindow):
             self._goto_step(4)
 
     def _step4_save(self):
-        """
-        Save WLC / AP command lists and FTP info (if AP Image Download).
-        Defensive: checks widget existence before accessing them.
-        """
-        # Read WLC commands (if widget exists)
-        wlc_cmds = []
-        if hasattr(self, "wlc_cmd_box"):
+
+        
+
+            # ---------------- READ WLC COMMANDS ----------------
+            wlc_cmds = []
+            if hasattr(self, "wlc_cmd_box"):
+                try:
+                    wlc_cmds = [l.strip() for l in self.wlc_cmd_box.toPlainText().splitlines() if l.strip()]
+                except Exception:
+                    wlc_cmds = []
+
+            # ---------------- READ AP COMMANDS ----------------
+            ap_cmds = []
+            if hasattr(self, "ap_cmd_box"):
+                try:
+                    ap_cmds = [l.strip() for l in self.ap_cmd_box.toPlainText().splitlines() if l.strip()]
+                except Exception:
+                    ap_cmds = []
+
+# Per-WLC boxes are optional — empty means use the shared list above
+
+            # ---------------- FTP VALIDATION (KEEP YOUR LOGIC) ----------------
+            ap_mode = None
+            if hasattr(self, "ap_mode_dd") and callable(getattr(self.ap_mode_dd, "currentText", None)):
+                ap_mode = self.ap_mode_dd.currentText()
+            else:
+                ap_mode = getattr(self, "ap_mode", "AP Custom Cmd List")
+
+            if ap_mode == "AP Image Download":
+                ftp_missing = False
+
+                ftp_user = getattr(self, "ftp_user", None)
+                ftp_pasw = getattr(self, "ftp_pasw", None)
+                ftp_addr = getattr(self, "ftp_addr", None)
+                ftp_path = getattr(self, "ftp_path", None)
+                scp_port = getattr(self, "scp_port", None)
+
+                if not (ftp_user and ftp_user.text().strip()):
+                    ftp_missing = True
+                if not (ftp_pasw and ftp_pasw.text()):
+                    ftp_missing = True
+
+                if ftp_missing:
+                    QMessageBox.critical(self, "FTP Missing", "FTP(SFTP) fields are mandatory for AP Image Download.")
+                    return False
+
+                if self.ini:
+                    try:
+                        self.ini.bulk_set("FTP", {
+                            "ftp_addr": ftp_addr.text().strip() if ftp_addr else "",
+                            "ftp_path": ftp_path.text().strip() if ftp_path else "",
+                            "ftp_user(sftp)": ftp_user.text().strip(),
+                            "ftp_pasw(sftp)": ftp_pasw.text(),
+                            "scp_port": scp_port.text().strip() if scp_port and scp_port.text().strip() else "22"
+                        })
+                        self.ini.save()
+                    except Exception:
+                        QMessageBox.warning(self, "Warning", "Failed to save FTP settings.")
+
+            # ---------------- CREATE CONFIG DIR ----------------
             try:
-                wlc_cmds = [l.strip() for l in self.wlc_cmd_box.toPlainText().splitlines() if l.strip()]
+                os.makedirs(CONFD, exist_ok=True)
             except Exception:
-                wlc_cmds = []
+                QMessageBox.critical(self, "Disk Error", f"Unable to create config folder: {CONFD}")
+                return False
 
-        # Read AP commands (if widget exists)
-        ap_cmds = []
-        if hasattr(self, "ap_cmd_box"):
-            try:
-                ap_cmds = [l.strip() for l in self.ap_cmd_box.toPlainText().splitlines() if l.strip()]
-            except Exception:
-                ap_cmds = []
+            # ---------------- SAVE GLOBAL WLC FILE (OPTIONAL BACKUP) ----------------
+            if wlc_cmds:
+                try:
+                    with open(os.path.join(CONFD, "cmdlist_wlc.txt"), "w", encoding="utf-8") as f:
+                        f.write("\n".join(wlc_cmds) + "\n")
+                except Exception as e:
+                    QMessageBox.warning(self, "Save Error", f"Failed to write WLC cmd list: {e}")
 
-        # Determine AP mode (prefer widget, fallback to state)
-        ap_mode = None
-        if hasattr(self, "ap_mode_dd") and callable(getattr(self.ap_mode_dd, "currentText", None)):
-            ap_mode = self.ap_mode_dd.currentText()
-        else:
-            ap_mode = getattr(self, "ap_mode", "AP Custom Cmd List")
+            # ---------------- SAVE AP COMMAND FILE ----------------
+            if ap_cmds:
+                fname = "cmdlist_cos_qca.txt"
+                try:
+                    dev = getattr(self, "ap_device", "cos_qca")
+                    if dev == "cos":
+                        fname = "cmdlist_cos.txt"
+                    elif dev == "cos_bcm":
+                        fname = "cmdlist_cos_bcm.txt"
+                except Exception:
+                    pass
 
-            # If AP Image Download is selected, validate FTP fields
+                try:
+                    with open(os.path.join(CONFD, fname), "w", encoding="utf-8") as f:
+                        f.write("\n".join(ap_cmds) + "\n")
+                except Exception as e:
+                    QMessageBox.warning(self, "Save Error", f"Failed to write AP cmd list: {e}")
 
-            if not (ftp_user and ftp_user.text().strip()):
-                ftp_missing = True
-            if not (ftp_pasw and ftp_pasw.text()):
-                ftp_missing = True
+            # ---------------- UPDATE INTERNAL STATE ----------------
+            self.wlc_cmds = wlc_cmds
+            self.ap_cmds = ap_cmds
 
-            if ftp_missing:
-                QMessageBox.critical(self, "FTP Missing", "FTP(SFTP) fields are mandatory for AP Image Download.")
-                return
-            # If present, persist FTP into INI (defensive)
-            if self.ini:
+            # ---------------- SAVE PER-WLC COMMANDS (FINAL SOURCE) ----------------
+            if hasattr(self, "per_wlc_cmd_boxes") and self.ini:
+
+                # 🔥 CLEAR OLD SECTIONS FIRST
+                for sec in list(self.ini.cfg.sections()):
+                    if sec.endswith("_CMDS"):
+                        self.ini.cfg.remove_section(sec)
+
+                # 🔥 SAVE ALL (STRICT)
+                # Save per-WLC overrides; blank box = remove section (use shared list)
+                for section, box in self.per_wlc_cmd_boxes.items():
+                    cmds = box.toPlainText().strip()
+                    cmds_section = f"{section}_CMDS"
+                    if cmds:
+                        if not self.ini.cfg.has_section(cmds_section):
+                            self.ini.cfg.add_section(cmds_section)
+                        self.ini.cfg.set(cmds_section, "cmds", cmds)
+                    else:
+                        if self.ini.cfg.has_section(cmds_section):
+                            self.ini.cfg.remove_section(cmds_section)
+
+                try:
+                    self.ini.save()
+                except Exception:
+                    QMessageBox.warning(self, "Warning", "Failed to save WLC command sections.")
+
+            # ---------------- SAVE PROTOCOL INFO ----------------
+            if hasattr(self, "proto_dd") and self.ini:
                 try:
                     self.ini.bulk_set("FTP", {
-                        "ftp_addr": ftp_addr.text().strip(),
-                        "ftp_path": ftp_path.text().strip(),
-                        "ftp_user(sftp)": ftp_user.text().strip(),
-                        "ftp_pasw(sftp)": ftp_pasw.text(),
-                        "scp_port": scp_port.text().strip() if scp_port and scp_port.text().strip() else "22"
+                        "ftp_proto": self.proto_dd.currentText(),
+                        "ftp_user": self.ftp_user.text().strip() if hasattr(self, "ftp_user") else "",
+                        "ftp_pasw": self.ftp_pasw.text() if hasattr(self, "ftp_pasw") else "",
                     })
                     self.ini.save()
                 except Exception:
-                    # non-fatal: continue but inform user
-                    QMessageBox.warning(self, "Warning", "Failed to save FTP settings to config.ini (continuing).")
+                    pass
 
-        # Persist ap_cmds/wlc_cmds to confd/ files
-        try:
-            os.makedirs(CONFD, exist_ok=True)
-        except Exception:
-            # if cannot create confd, warn and return
-            QMessageBox.critical(self, "Disk Error", f"Unable to create config folder: {CONFD}")
-            return
+            QMessageBox.information(self, "Saved", "Cmd lists (and FTP(SFTP) details if provided) saved under confd/")
 
-        # Save WLC commands (if any)
-        if wlc_cmds:
-            try:
-                with open(os.path.join(CONFD, "cmdlist_wlc.txt"), "w", encoding="utf-8") as f:
-                    f.write("\n".join(wlc_cmds) + "\n")
-            except Exception as e:
-                QMessageBox.warning(self, "Save Error", f"Failed to write WLC cmd list: {e}")
-
-        # Save AP commands (if any) into file based on ap_device
-        if ap_cmds:
-            # decide filename; default to cos_qca
-            fname = "cmdlist_cos_qca.txt"
-            try:
-                dev = getattr(self, "ap_device", "cos_qca")
-                if dev == "cos":
-                    fname = "cmdlist_cos.txt"
-                elif dev == "cos_bcm":
-                    fname = "cmdlist_cos_bcm.txt"
-                else:
-                    fname = "cmdlist_cos_qca.txt"
-            except Exception:
-                fname = "cmdlist_cos_qca.txt"
-
-            try:
-                with open(os.path.join(CONFD, fname), "w", encoding="utf-8") as f:
-                    f.write("\n".join(ap_cmds) + "\n")
-            except Exception as e:
-                QMessageBox.warning(self, "Save Error", f"Failed to write AP cmd list: {e}")
-
-        # Update internal state so the rest of the GUI knows the saved lists
-        self.wlc_cmds = wlc_cmds
-        self.ap_cmds = ap_cmds
-        # Save SFTP credentials to INI so engine can read them
-        if hasattr(self, "proto_dd") and self.ini:
-            try:
-                self.ini.bulk_set("FTP", {
-                    "ftp_proto": self.proto_dd.currentText(),
-                    "ftp_user": self.ftp_user.text().strip() if hasattr(self, "ftp_user") else "",
-                    "ftp_pasw": self.ftp_pasw.text() if hasattr(self, "ftp_pasw") else "",
-                })
-                self.ini.save()
-            except Exception:
-                pass
-        QMessageBox.information(self, "Saved", "Cmd lists (and FTP(SFTP) details if provided) saved under confd/")
-
+            return True
     def _save_run_log(self):
         """
         Save the Run Log contents to data/WlanPoller_RunLog_YYYYMMDD_HHMMSS.txt.
@@ -2441,10 +2766,56 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Folder Failed", str(e))
     def _on_workflow_change(self, v: str):
         self.workflow = v
-
+        if hasattr(self, "upload_config_widget"):
+            self.upload_config_widget.setVisible(v == "Upload Files from AP")
     # ... (remaining methods: _step3_proceed, _on_ap_mode_changed, _step4_save, _step4_proceed, _enforce_one_filter,
     # _update_ap_device_from_model, _step5_preview are defined earlier in file - kept unchanged for brevity) ...
     # For completeness they are implemented above in the full content.
+    def _on_upload_proto_changed(self, proto: str):
+        """Show/hide SFTP credential fields in the upload config block."""
+        is_sftp = (proto == "SFTP")
+        for attr in ("upload_sftp_user", "upload_sftp_pass",
+                     "upload_sftp_user_label", "upload_sftp_pass_label"):
+            if hasattr(self, attr):
+                getattr(self, attr).setVisible(is_sftp)
+    def _on_upload_proto_changed(self, proto: str):
+        """Show/hide SFTP credential fields in the upload config block."""
+        is_sftp = (proto == "SFTP")
+        for attr in ("upload_sftp_user", "upload_sftp_pass",
+                     "upload_sftp_user_label", "upload_sftp_pass_label"):
+            if hasattr(self, attr):
+                getattr(self, attr).setVisible(is_sftp)
+    def _build_upload_cmds(self, file_type: str, proto: str, server_ip: str) -> List[str]:
+        """
+        Build the AP CLI command(s) for the Upload Files workflow.
+
+        TFTP example: copy syslogs tftp: 192.168.0.10/
+        SFTP example: ip sftp username admin
+                      ip sftp password <pass>
+                      copy syslogs sftp: 192.168.0.10/
+        """
+        type_map = {
+            "Syslogs":       "syslogs",
+            "Core Files":    "core:",
+            "CrashFiles":    "crashinfo:",
+            "SupportBundle": "support-bundle",
+        }
+        source = type_map.get(file_type, "syslogs")
+
+        cmds = []
+
+        if proto == "SFTP":
+            user = self.upload_sftp_user.text().strip() if hasattr(self, "upload_sftp_user") else ""
+            pasw = self.upload_sftp_pass.text() if hasattr(self, "upload_sftp_pass") else ""
+            if user:
+                cmds.append(f"ip sftp username {user}")
+            if pasw:
+                cmds.append(f"ip sftp password {pasw}")
+            cmds.append(f"copy {source} sftp://{server_ip}/")
+        else:
+            cmds.append(f"copy {source} tftp://{server_ip}/")
+
+        return cmds
     def _on_proto_changed(self, proto):
         is_sftp = (proto == "SFTP")
 
@@ -2554,6 +2925,39 @@ class MainWindow(QMainWindow):
             # ---------------- FLAGS ----------------
             wf = summary.get("workflow") or getattr(self, "workflow", None)
             is_wlc_only = summary.get("operation") == "WLC Only"
+            # ---------------- CLIENT AUTH LOOP FIXER ----------------
+            if "delete_list" in summary:
+
+                delete_list = summary["delete_list"]
+
+                if not delete_list:
+                    QMessageBox.information(self, "Info", "No clients to delete.")
+                    return
+
+                msg = "Ready to delete these clients?\n\n" + "\n".join(delete_list)
+
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Deauthentication",
+                    msg,
+                    QMessageBox.Yes | QMessageBox.No
+                )
+
+                if reply == QMessageBox.Yes:
+                    if hasattr(self, "run_log"):
+                        self.run_log.append("\n[AUTH] User approved deletion\n")
+
+                    engine = PollerEngine(log_cb=lambda m: self.run_log.append(m))
+                    engine.deauth_clients(delete_list)
+
+                    if hasattr(self, "run_log"):
+                        self.run_log.append("[AUTH] Deauthentication completed\n")
+
+                else:
+                    if hasattr(self, "run_log"):
+                        self.run_log.append("[AUTH] User cancelled deletion\n")
+
+                return
 
             # ---------------- VULNERABLE TABLE ----------------
             if hasattr(self, "vuln_table"):
@@ -2766,63 +3170,72 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_ap_update(self, *args):
-        try:
-            if len(args) < 4:
-                return
+        # ✅ SAFE UNPACKING (handles both 4 and 6 args)
 
-            ip = str(args[1]) if args[1] else ""
-            model = str(args[2]) if args[2] else ""
-            status = str(args[3]) if args[3] else ""
-            name = str(args[4]) if len(args) > 4 and args[4] else ""
+        row = None
+        ip = model = status = name = wlc = ""
 
-            if not hasattr(self, "ap_table"):
-                return
+        if len(args) == 6:
+            row, ip, model, status, name, wlc = args
 
-            # Find row by IP instead of trusting index
-            target_row = -1
-            for r in range(self.ap_table.rowCount()):
-                item = self.ap_table.item(r, 2)  # AP IP column
-                if item and item.text() == ip:
-                    target_row = r
-                    break
+        elif len(args) == 5:
+            row, ip, model, status, name = args
 
-            # If IP not found, append new row
-            if target_row == -1:
-                target_row = self.ap_table.rowCount()
-                self.ap_table.insertRow(target_row)
+        elif len(args) == 4:
+            ip, model, status, name = args
 
-            # Fallback name logic
+        else:
+            print("[ERROR] Unexpected args in _on_ap_update:", args)
+            return
+        # 🔥 FIX 1: NEVER trust engine row index (prevents overwrite bug)
+        row = self.ap_table.rowCount()
+        self.ap_table.insertRow(row)
+        self.ap_table.resizeRowToContents(row)
+        # ---------------- AP ONLY MODE ----------------
+        if self.operation_type == "AP Only":
+
+            # fallback name
             if not name:
-                if hasattr(self, "ap_name_map"):
-                    name = self.ap_name_map.get(ip, "")
+                name = self.ap_name_map.get(ip, f"AP_{ip.replace('.', '_')}")
 
-            # FINAL fallback (your preferred format)
-            if not name and ip:
-                name = f"AP_{ip.replace('.', '_')}"
+            self.ap_table.setItem(row, 0, QTableWidgetItem(name))
+            self.ap_table.setItem(row, 1, QTableWidgetItem(model or "UNKNOWN"))
+            self.ap_table.setItem(row, 2, QTableWidgetItem(ip))
+            status_item = QTableWidgetItem(status)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.ap_table.setItem(row, 3, status_item)
 
-            self.ap_table.setItem(target_row, 0, QTableWidgetItem(name))
-            # Prevent overwriting correct model with UNKNOWN
-            existing_item = self.ap_table.item(target_row, 1)
-            existing_model = existing_item.text() if existing_item else ""
+        # ---------------- WLC & AP MODE ----------------
+        else:
 
-            if model and model != "UNKNOWN":
-                final_model = model
-            elif existing_model and existing_model != "UNKNOWN":
-                final_model = existing_model
-            else:
-                final_model = "UNKNOWN"
+            self.ap_table.setItem(row, 0, QTableWidgetItem(wlc or "-"))
+            self.ap_table.setItem(row, 1, QTableWidgetItem(name or "-"))
+            self.ap_table.setItem(row, 2, QTableWidgetItem(model or "UNKNOWN"))
+            self.ap_table.setItem(row, 3, QTableWidgetItem(ip))
+            status_item = QTableWidgetItem(status)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.ap_table.setItem(row, 4, status_item)
 
-            self.ap_table.setItem(target_row, 1, QTableWidgetItem(final_model))
-            self.ap_table.setItem(target_row, 2, QTableWidgetItem(ip))
-            self.ap_table.setItem(target_row, 3, QTableWidgetItem(status))
-            self.ap_table.resizeRowToContents(target_row)
-            if hasattr(self, "run_log"):
-                self.run_log.append(f"[AP_UPDATE] ip={ip} status={status}")
+        # 🔥 FIX 2: Safe status coloring
+        status_col = self.ap_table.columnCount() - 1
+        item = self.ap_table.item(row, status_col)
 
-        except Exception as e:
-            if hasattr(self, "run_log"):
-                self.run_log.append(f"[ERROR] _on_ap_update exception: {e}")
+        if item:
+            status_lower = status.lower()
 
+            if "success" in status_lower:
+                item.setForeground(Qt.green)
+                item.setBackground(Qt.transparent)
+
+            elif "fail" in status_lower or "error" in status_lower:
+                item.setForeground(Qt.red)
+
+                # 🔥 restore old highlighted look
+                item.setBackground(QColor(255, 230, 230))  # light red background
+                item.setToolTip(status)  # full message on hover
+
+        # 🔥 FIX 3: Always scroll (better UX)
+        self.ap_table.scrollToBottom()
     def _fill_preview(self):
         """
         Build Step-6 Preview safely.
@@ -2884,7 +3297,20 @@ class MainWindow(QMainWindow):
                 wf = get_dd(self.workflow_dd)
 
         lines.append(f"   - {wf}")
+        if self.workflow == "Client Stuck In Auth Loop":
 
+            lines.append("Workflow: Client Stuck In Auth Loop")
+            lines.append("")
+            lines.append("Operation Summary:")
+            lines.append("- Detect clients stuck in 'Authenticating' state")
+            lines.append("- Compare client list over 2 intervals")
+            lines.append("- Identify persistent auth loop clients")
+            lines.append("- Deauthenticate affected clients automatically")
+            lines.append("")
+            lines.append("Commands Used:")
+            lines.append("1. show wireless client summary | include Authenticating")
+            lines.append("2. show wireless client mac <mac> detail")
+            lines.append("3. wireless client mac-address <mac> deauthenticate")
         # ---------------- CLI COMMANDS  (MERGED) ----------------
         wlc_cmds = []
         ap_cmds = []
@@ -2915,6 +3341,18 @@ class MainWindow(QMainWindow):
 
 
         # ---------------- AP Filters ----------------
+        # ---------------- Upload Settings ----------------
+        if getattr(self, "workflow", "") == "Upload Files from AP":
+            lines.append("")
+            section("Upload Settings")
+            ft  = self.upload_file_type_dd.currentText()     if hasattr(self, "upload_file_type_dd")     else getattr(self, "upload_file_type", "")
+            pr  = self.upload_proto_dd.currentText()         if hasattr(self, "upload_proto_dd")         else getattr(self, "upload_proto", "TFTP")
+            srv = self.upload_server_ip_field.text().strip() if hasattr(self, "upload_server_ip_field") else getattr(self, "upload_server_ip_val", "")
+            lines.append(f"   - File Type : {ft}")
+            lines.append(f"   - Protocol  : {pr}")
+            lines.append(f"   - Server IP : {srv}")
+
+        # ---------------- AP Filters ----------------
         lines.append("")
         section("AP Filters")
 
@@ -2937,7 +3375,7 @@ class MainWindow(QMainWindow):
 
             else:
                 lines.append("   - No Filters Applied")
-
+        
         # ---------------- Render Preview ----------------
         if hasattr(self, "preview_text"):
             try:
@@ -3091,7 +3529,7 @@ class MainWindow(QMainWindow):
 
         show_wlc_cmd = (
                 self.operation_type in ("WLC Only", "WLC & AP")
-                and getattr(self, "workflow", "") != "AP Flash Checker"
+                and getattr(self, "workflow", "") not in ("AP Flash Checker", "Upload Files from AP")
         )
         if hasattr(self, "wlc_cmd_section"):
             self.wlc_cmd_section.setVisible(show_wlc_cmd)
@@ -3162,6 +3600,9 @@ class MainWindow(QMainWindow):
 
         super().changeEvent(event)
     def _add_wlc_entry(self):
+        if len(self.wlc_entries) >= 3:
+            return  # max 3 WLCs
+
         idx = len(self.wlc_entries)
 
         entry_widget = QWidget()
@@ -3177,11 +3618,14 @@ class MainWindow(QMainWindow):
         hdr.addWidget(lbl)
         hdr.addStretch()
 
-        btn_remove = QPushButton("✕ Remove")
-        btn_remove.setFixedHeight(24)
-        btn_remove.setStyleSheet("min-width:60px; font-size:11px;")
-        btn_remove.clicked.connect(lambda _, ew=entry_widget: self._remove_wlc_entry(ew))
-        hdr.addWidget(btn_remove)
+        remove_btn = QPushButton("Remove WLC")
+        remove_btn.setFixedHeight(28)
+        remove_btn.setVisible(True)
+        remove_btn.setStyleSheet("min-width:60px; font-size:11px;")
+        remove_btn.clicked.connect(lambda _, ew=entry_widget: self._remove_wlc_entry(ew))
+        # Only show remove if not WLC1
+        remove_btn.setVisible(idx > 0)
+        hdr.addWidget(remove_btn)
         entry_layout.addLayout(hdr)
 
         form = QFormLayout()
@@ -3189,22 +3633,37 @@ class MainWindow(QMainWindow):
 
         ip_field = QLineEdit()
         ip_field.setFixedHeight(28)
-        ip_field.setPlaceholderText("WLC IP")
+        ip_field.setPlaceholderText("WLC IP  (Required)" if idx > 0 else "WLC IP")
 
         user_field = QLineEdit()
         user_field.setFixedHeight(28)
-        user_field.setPlaceholderText("Username")
+        user_field.setPlaceholderText("Username  (Required)" if idx > 0 else "Username")
 
         pasw_field = QLineEdit()
         pasw_field.setFixedHeight(28)
         pasw_field.setEchoMode(QLineEdit.Password)
-        pasw_field.setPlaceholderText("Password")
+        pasw_field.setPlaceholderText("Password  (Required)" if idx > 0 else "Password")
 
-        # Pre-fill first entry from ini
-        # Pre-fill from ini — first entry uses [WLC], subsequent use [WLC2], [WLC3]...
+        # Red border on empty mandatory fields for WLC2/WLC3
+        if idx > 0:
+            EMPTY_STYLE  = "border: 1px solid #dc2626; border-radius:4px;"
+            FILLED_STYLE = "border: 1px solid #e6e8eb; border-radius:4px;"
+
+            def _update_style(text, field=None):
+                field.setStyleSheet(EMPTY_STYLE if not text.strip() else FILLED_STYLE)
+
+            ip_field.textChanged.connect(lambda t, f=ip_field: _update_style(t, f))
+            user_field.textChanged.connect(lambda t, f=user_field: _update_style(t, f))
+            pasw_field.textChanged.connect(lambda t, f=pasw_field: _update_style(t, f))
+
+            # Set initial red border since fields start empty
+            ip_field.setStyleSheet(EMPTY_STYLE)
+            user_field.setStyleSheet(EMPTY_STYLE)
+            pasw_field.setStyleSheet(EMPTY_STYLE)
+
+        # Pre-fill from ini
         if self.ini:
             section = "WLC" if idx == 0 else f"WLC{idx+1}"
-
             ip_field.setText(self.ini.get(section, "wlc_ip"))
             user_field.setText(self.ini.get(section, "wlc_user"))
             pasw_field.setText(self.ini.get(section, "wlc_pasw"))
@@ -3220,23 +3679,84 @@ class MainWindow(QMainWindow):
             "ip": ip_field,
             "user": user_field,
             "pasw": pasw_field,
+            "remove_btn": remove_btn,
         })
 
+        # Disable Add WLC button when at max
+        if hasattr(self, "btn_add_wlc"):
+            self.btn_add_wlc.setEnabled(len(self.wlc_entries) < 3)
+        if hasattr(self, "per_wlc_cmd_section"):
+            self._build_per_wlc_cmd_boxes()
     def _remove_wlc_entry(self, entry_widget):
-        if len(self.wlc_entries) <= 1:
-            QMessageBox.warning(self, "Cannot Remove", "At least one WLC entry is required.")
-            return
-        self.wlc_entries = [e for e in self.wlc_entries if e["widget"] is not entry_widget]
-        entry_widget.setParent(None)
-        entry_widget.deleteLater()
-        # Renumber labels
-        for i, e in enumerate(self.wlc_entries):
-            lbl = e["widget"].findChild(QLabel)
-            if lbl:
-                lbl.setText(f"WLC {i + 1}")
-    
+            if len(self.wlc_entries) <= 1:
+                return
+            self.wlc_entries = [e for e in self.wlc_entries if e["widget"] is not entry_widget]
+            entry_widget.setParent(None)
+            entry_widget.deleteLater()
 
-    
+            # Renumber labels and fix remove button visibility
+            # Renumber labels and fix remove button visibility
+            for i, e in enumerate(self.wlc_entries):
+                lbl = e["widget"].findChild(QLabel)
+                if lbl:
+                    lbl.setText(f"WLC {i + 1}")
+                btn = e.get("remove_btn")
+                if btn:
+                    btn.setText("Remove")   # ensure label is always present
+                    btn.setVisible(i > 0)   # WLC1 never shows remove
+
+            # Re-enable Add WLC button since we're below max
+            if hasattr(self, "btn_add_wlc"):
+                self.btn_add_wlc.setEnabled(len(self.wlc_entries) < 3)
+    def _validate_all_wlcs(self):
+        missing = []
+
+        for idx, entry in enumerate(self.wlc_entries):
+            ip = entry["ip"].text().strip()
+            user = entry["user"].text().strip()
+            pwd = entry["pasw"].text().strip()   # ✅ FIXED
+
+            if not ip or not user or not pwd:
+                missing.append(f"WLC {idx + 1}")
+
+        return missing
+    def _remove_last_wlc_entry(self):
+        if len(self.wlc_entries) > 1:
+            entry = self.wlc_entries.pop()
+            entry["widget"].setParent(None)
+    def _update_workflow_dropdown(self):
+
+        if not hasattr(self, "workflow_dd"):
+            return
+
+        self.workflow_dd.blockSignals(True)
+        self.workflow_dd.clear()
+
+        # ✅ WLC ONLY
+        if self.operation_type == "WLC Only":
+            self.workflow_dd.addItems([
+                "Custom CLI Commands",
+                "Client Stuck In Auth Loop"
+            ])
+
+        # ✅ WLC & AP  ❗ REMOVE AUTH LOOP HERE
+        elif self.operation_type == "WLC & AP":
+            self.workflow_dd.addItems([
+                "AP Flash Checker",
+                "Custom CLI Commands",
+                
+            ])
+
+        # ✅ AP ONLY
+        elif self.operation_type == "AP Only":
+            self.workflow_dd.addItems([
+                "AP Flash Checker",
+                "Custom CLI Commands",
+                "Upload Files from AP"
+            ])
+
+        self.workflow_dd.setCurrentIndex(0)
+        self.workflow_dd.blockSignals(False)
 def resource_path(relpath: str) -> str:
     """
     Return a filesystem path to `relpath` that works when running normally
