@@ -491,7 +491,10 @@ class PollerWorker(QThread):
                 self.log.emit("=" * 56)
 
                 # THEN vulnerability analysis
-                if self.workflow == "AP Flash Checker" and analyze_logs:
+                if (
+                    self.workflow == "AP Flash Checker"
+                    and analyze_logs
+                    and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))):
                     self.log.emit("")
                     self.log.emit("=" * 56)
                     self.log.emit("  RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
@@ -548,7 +551,11 @@ class PollerWorker(QThread):
                         "data_dir": getattr(engine, "data_dir", "")
                     })
 
-                if self.workflow == "AP Flash Checker" and analyze_logs:
+                if (
+                        self.workflow == "AP Flash Checker"
+                        and analyze_logs
+                        and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))
+                    ):
                     self.log.emit("")
                     self.log.emit("=" * 56)
                     self.log.emit(" RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
@@ -1038,22 +1045,31 @@ class MainWindow(QMainWindow):
         c_l = QVBoxLayout(card)
         c_l.setContentsMargins(25, 25, 25, 25)
         c_l.setSpacing(25)
-
+        # Label
         c_l.addWidget(QLabel("Choose a WorkFlow"))
 
+        # ── WORKFLOW DROPDOWN ─────────────────────────
         self.workflow_dd = QComboBox()
-        # add items
-        self.workflow_dd.addItems([])
+        self.workflow_dd.addItems([
+            "Custom CLI Commands",
+            "AP Flash Checker",
+            "Upload Files from AP",   # if already exists keep it
+            "AP Cleanup + Reload"     # ✅ NEW WORKFLOW
+        ])
         self.workflow_dd.currentTextChanged.connect(self._on_workflow_change)
         self.workflow_dd.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.workflow_dd.setFixedHeight(30)
         c_l.addWidget(self.workflow_dd)
+        
 
-        # ── UPLOAD FILES CONFIG (visible only when Upload workflow selected) ──
+       
+       
+        # ── UPLOAD CONFIG ─────────────────────────────
         self.upload_config_widget = QWidget()
         self.upload_config_widget.setStyleSheet(
             "background:#f0f9ff; border:1px solid #bae6fd; border-radius:6px; padding:4px;"
         )
+
         upload_cfg_layout = QFormLayout(self.upload_config_widget)
         upload_cfg_layout.setContentsMargins(12, 10, 12, 10)
         upload_cfg_layout.setSpacing(8)
@@ -1064,30 +1080,25 @@ class MainWindow(QMainWindow):
 
         self.upload_file_type_dd = QComboBox()
         self.upload_file_type_dd.addItems(["SupportBundle"])
-        self.upload_file_type_dd.setFixedHeight(28)
         upload_cfg_layout.addRow("File Type:", self.upload_file_type_dd)
 
         self.upload_proto_dd = QComboBox()
         self.upload_proto_dd.addItems(["TFTP", "SFTP"])
-        self.upload_proto_dd.setFixedHeight(28)
         self.upload_proto_dd.currentTextChanged.connect(self._on_upload_proto_changed)
         upload_cfg_layout.addRow("Protocol:", self.upload_proto_dd)
 
         self.upload_server_ip_field = QLineEdit()
         self.upload_server_ip_field.setPlaceholderText("Server IP  e.g. 192.168.0.10")
-        self.upload_server_ip_field.setFixedHeight(28)
         upload_cfg_layout.addRow("Server IP:", self.upload_server_ip_field)
 
         self.upload_sftp_user_label = QLabel("SFTP Username:")
         self.upload_sftp_user = QLineEdit()
-        self.upload_sftp_user.setFixedHeight(28)
         self.upload_sftp_user.setVisible(False)
         self.upload_sftp_user_label.setVisible(False)
 
         self.upload_sftp_pass_label = QLabel("SFTP Password:")
         self.upload_sftp_pass = QLineEdit()
         self.upload_sftp_pass.setEchoMode(QLineEdit.Password)
-        self.upload_sftp_pass.setFixedHeight(28)
         self.upload_sftp_pass.setVisible(False)
         self.upload_sftp_pass_label.setVisible(False)
 
@@ -1095,9 +1106,9 @@ class MainWindow(QMainWindow):
         upload_cfg_layout.addRow(self.upload_sftp_pass_label, self.upload_sftp_pass)
 
         self.upload_config_widget.setVisible(False)
-        c_l.addWidget(self.upload_config_widget)
 
-        # small breathing room inside card (no big stretch)
+        c_l.addWidget(self.upload_config_widget)
+        
         c_l.addSpacing(6)
 
         # Add the card to page layout
@@ -1121,7 +1132,10 @@ class MainWindow(QMainWindow):
         # Align the row the same way as in Step1/Step2: right-aligned
         # (we already added an expanding spacer before the back button)
         lay.addLayout(row)
-        QTimer.singleShot(0, self._update_workflow_dropdown)
+        
+
+        
+       
         return w
 
     def _page_step4(self) -> QWidget:
@@ -1958,7 +1972,7 @@ class MainWindow(QMainWindow):
 
         # Load AP cmds — but NEVER overwrite if workflow already built them
         # (Upload Files from AP and AP Flash Checker build cmds in _step3_proceed)
-        _workflows_that_prebuild_cmds = ("Upload Files from AP", "AP Flash Checker")
+        _workflows_that_prebuild_cmds = ("Upload Files from AP", "AP Flash Checker", "TMP Cleanup + reload")
         if getattr(self, "workflow", "") not in _workflows_that_prebuild_cmds:
             if hasattr(self, "ap_cmd_box"):
                 box_cmds = [l.strip() for l in self.ap_cmd_box.toPlainText().splitlines() if l.strip()]
@@ -2047,6 +2061,8 @@ class MainWindow(QMainWindow):
                 ap_list_file=ap_list_file,
                 ap_mode=getattr(self, "ap_mode", "AP Custom Cmd List"),
             )
+            self.worker.enable_tmp_cleanup = getattr(self, "enable_tmp_cleanup", False)
+            self.worker.enable_reload = getattr(self, "enable_reload", False)
         except Exception as e:
             QMessageBox.critical(self, "Worker Error", f"Failed to create worker: {e}")
             return
@@ -2211,7 +2227,8 @@ class MainWindow(QMainWindow):
                 f"Please fill credentials for:\n{', '.join(missing)}"
             )
             return  # 🚫 BLOCK navigation
-
+        self._update_workflow_dropdown()
+        
         # ✅ Only move if validation passed
         self._goto_step(2)
     def _step3_proceed(self):
@@ -2221,6 +2238,7 @@ class MainWindow(QMainWindow):
         - AP Image Download: set ap_mode and SKIP Step4 -> Step5 (user must provide FTP elsewhere).
         - Custom CLI Commands: go to Step4 so user can edit WLC/AP cmd lists.
         """
+        
         # Prefer the widget value if present, else use stored state
         if hasattr(self, "workflow_dd") and callable(getattr(self.workflow_dd, "currentText", None)):
             wf = self.workflow_dd.currentText()
@@ -2229,7 +2247,26 @@ class MainWindow(QMainWindow):
 
         # Persist selection in UI state
         self.workflow = wf
+        # ==============================
+        # AP CLEANUP + RELOAD (NEW)
+        # ==============================
+        if wf == "TMP Cleanup + reload":
 
+            self.ap_cmds = ["%reload%"]
+            self.ap_mode = "AP Custom Cmd List"
+            self.ap_filter_mode = "NONE"
+
+            self._fill_preview()
+
+            self.sidebar.blockSignals(True)
+            self.sidebar.setCurrentRow(5)
+            self.sidebar.blockSignals(False)
+            self.stack.setCurrentIndex(5)
+
+            return
+
+            
+        # AP Flash Checker -> set default AP cmds and skip Step4
         # AP Flash Checker -> set default AP cmds and skip Step4
         if wf == "AP Flash Checker":
 
@@ -2239,31 +2276,31 @@ class MainWindow(QMainWindow):
                 "show flash",
                 "show flash | i cnssdaemon.log",
                 "show boot",
-                "show filesystems",
-                "show image integrity",
+                
             ]
+            
 
             self.ap_mode = getattr(self, "ap_mode", "AP Custom Cmd List")
 
-            # ---- NEW LOGIC ----
+            # 🔥 NEW: STORE USER OPTIONS
+            self.enable_tmp_cleanup = False
+            self.enable_reload = False
+                
+            
+            # ---- FLOW CONTROL ----
             if self.operation_type == "AP Only":
-                # Skip filters → go directly to preview
+
                 self.ap_filter_mode = "NONE"
+
                 self._fill_preview()
-                self._goto_step(5)  # Step6 Preview
+                self._goto_step(5)   # Step6 Preview
+
             else:
-                # WLC & AP still uses filters
                 self._goto_step(4)
 
             return
-
         # AP Image Download -> remember mode and skip Step4
-        if wf == "AP Image Download":
-            self.ap_mode = "AP Image Download"
-            # If you want FTP inputs to be editable when skipping Step4,
-            # ensure _refresh_visibility or Step5 shows them (we earlier discussed that).
-            self._goto_step(4)
-            return
+        
 # AP Image Download -> remember mode and skip Step4
         if wf == "AP Image Download":
             self.ap_mode = "AP Image Download"
@@ -2766,8 +2803,24 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Folder Failed", str(e))
     def _on_workflow_change(self, v: str):
         self.workflow = v
+
+        # Upload config visibility
         if hasattr(self, "upload_config_widget"):
             self.upload_config_widget.setVisible(v == "Upload Files from AP")
+
+        # 🔥 FLASH CHECKER VISIBILITY
+        if hasattr(self, "flash_options_widget"):
+
+            if self.operation_type == "AP Only" and v == "AP Flash Checker":
+                self.flash_options_widget.setVisible(True)
+
+                if hasattr(self, "tmp_hint_label"):
+                    self.tmp_hint_label.setText(
+                        "Note: /tmp cleanup will run only on APs with >60% usage."
+                    )
+
+            else:
+                self.flash_options_widget.setVisible(False)
     # ... (remaining methods: _step3_proceed, _on_ap_mode_changed, _step4_save, _step4_proceed, _enforce_one_filter,
     # _update_ap_device_from_model, _step5_preview are defined earlier in file - kept unchanged for brevity) ...
     # For completeness they are implemented above in the full content.
@@ -3375,6 +3428,32 @@ class MainWindow(QMainWindow):
 
             else:
                 lines.append("   - No Filters Applied")
+        if self.workflow == "TMP Cleanup + reload":
+            preview = []
+            preview.append("Workflow: AP Cleanup + Reload")
+            preview.append("")
+
+            preview.append("  1. Connects to each AP via SSH")
+            preview.append("  2. Executes 'reload' command on each AP")
+            preview.append("  3. Automatically confirms reload (if prompted)")
+            preview.append("")
+
+            preview.append("Commands executed per AP:")
+            preview.append("  • reload")
+            preview.append("")
+            preview.append("⚠ WARNING:")
+            preview.append("  This operation will reboot ALL selected APs.")
+            preview.append("  Ensure maintenance window before proceeding.")
+            op = getattr(self, "operation_type", "")
+            if op == "AP Only":
+                preview.append(f"AP List File: {getattr(self, 'ap_list_file', '')}")
+            else:
+                wlc_ip = self.wlc_entries[0]["ip"].text().strip() if getattr(self, "wlc_entries", []) else ""
+                preview.append(f"WLC IP: {wlc_ip}")
+            if hasattr(self, "preview_text"):
+                self.preview_text.setPlainText("\n".join(preview))
+            return
+
         
         # ---------------- Render Preview ----------------
         if hasattr(self, "preview_text"):
@@ -3744,7 +3823,7 @@ class MainWindow(QMainWindow):
             self.workflow_dd.addItems([
                 "AP Flash Checker",
                 "Custom CLI Commands",
-                
+                "TMP Cleanup + reload",
             ])
 
         # ✅ AP ONLY
@@ -3752,11 +3831,20 @@ class MainWindow(QMainWindow):
             self.workflow_dd.addItems([
                 "AP Flash Checker",
                 "Custom CLI Commands",
-                "Upload Files from AP"
+                "Upload Files from AP",
+                "TMP Cleanup + reload"
+                
             ])
 
         self.workflow_dd.setCurrentIndex(0)
         self.workflow_dd.blockSignals(False)
+        self._on_workflow_change(self.workflow_dd.currentText())
+    def _init_workflow_ui(self):
+        self._update_workflow_dropdown()
+
+        # 🔥 CRITICAL: trigger visibility AFTER dropdown is populated
+        current = self.workflow_dd.currentText()
+        self._on_workflow_change(current)
 def resource_path(relpath: str) -> str:
     """
     Return a filesystem path to `relpath` that works when running normally

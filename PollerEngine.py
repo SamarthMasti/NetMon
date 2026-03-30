@@ -975,6 +975,13 @@ class PollerEngine:
 
         # --- Normal command ---
         return (False, cmd, False, 0)
+    def _get_tmp_usage_percent(self, output: str) -> int:
+        for line in output.splitlines():
+            if "/tmp" in line.lower():
+                match = re.search(r"(\d+)%", line)
+                if match:
+                    return int(match.group(1))
+        return 0
     def _poll_one_ap(self, idx: int, ap: ApRow, device: str, cmds: List[str]):
         try:
             self._log(f"[AP] ({idx+1}) Connecting {ap.ip} ({ap.name}) {ap.model} ...")
@@ -1033,7 +1040,8 @@ class PollerEngine:
                 f"model='{ap.model}' version='{img}' Ip='{ap.ip}' SN='{sn}'>\n"
             )
             _safe_write_append(fname, header)
-
+            tmp_usage = 0
+            cleanup_done = False
             for cmd in cmds:
                 if self._shutdown_event.is_set():
                     return idx, ap.ip, ap.model, "Cancelled"
@@ -1047,27 +1055,86 @@ class PollerEngine:
                     time.sleep(sleep_secs)
                     continue
 
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
-
-                _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
-
                 cmd_lower = actual_cmd.lower()
 
-                is_transfer_cmd = (
-                        "sftp://" in cmd_lower
-                        or "scp://" in cmd_lower
-                        or "copy syslogs" in cmd_lower
-                        or "copy core:" in cmd_lower
-                        or "copy crashinfo:" in cmd_lower
-                        or "copy support-bundle" in cmd_lower
-                )
+                # ================================
+                # 🔥 TMP DETECTION
+                # ================================
+                if "show filesystems" in cmd_lower:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
+                    _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
+                    output = self._ap_send_command(conn, actual_cmd, read_timeout=120)
+                    tmp_usage = self._get_tmp_usage_percent(output)
+                    self._log(f"[TMP] {ap.ip} → /tmp usage = {tmp_usage}%")
+                    _safe_write_append(fname, output + "\n")
+                    _safe_write_append(fname, f"[TMP] /tmp usage detected: {tmp_usage}%\n")
+                    continue
 
+                # ================================
+                # 🔥 TMP CLEANUP (>60%)
+                # ================================
+                if "delete /force /recursive /tmp" in cmd_lower:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if tmp_usage > 60:
+                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
+                        _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
+                        self._log(f"[TMP] {ap.ip} → /tmp is {tmp_usage}% — running cleanup")
+                        try:
+                            conn.send_command_timing(actual_cmd)
+                            cleanup_done = True
+                            self._log(f"[TMP] {ap.ip} → Cleanup complete")
+                            _safe_write_append(fname, "[TMP] Cleanup executed successfully\n")
+                        except Exception as e:
+                            self._log(f"[TMP] {ap.ip} → Cleanup failed: {e}")
+                            _safe_write_append(fname, f"[TMP] Cleanup failed: {e}\n")
+                    else:
+                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd} [SKIPPED — /tmp={tmp_usage}%]")
+                        _safe_write_append(fname, f"\n[TMP] Cleanup skipped (/tmp={tmp_usage}%, threshold=60%)\n")
+                    continue
+
+                # ================================
+                # 🔥 RELOAD (ONLY IF CLEANED)
+                # ================================
+                if "reload" in cmd_lower:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    if True:
+                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
+                        _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
+                        self._log(f"[TMP] {ap.ip} → Injecting reload (cleanup was done)")
+                        try:
+                            out = conn.send_command_timing(actual_cmd)
+                            if "confirm" in out.lower():
+                                conn.send_command_timing("\n")
+                            self._log(f"[TMP] {ap.ip} → Reload initiated successfully")
+                            _safe_write_append(fname, "[TMP] Reload initiated\n")
+                        
+                        except Exception:
+                            self._log(f"[TMP] {ap.ip} → Connection closed after reload (expected)")
+                            _safe_write_append(fname, "[TMP] Connection closed after reload (expected)\n")
+                    else:
+                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd} [SKIPPED — no cleanup was needed]")
+                        _safe_write_append(fname, f"\n[TMP] Reload skipped (cleanup was not needed)\n")
+                    break
+
+                # ================================
+                # 🔥 TRANSFER COMMANDS (upload/copy)
+                # ================================
+                is_transfer_cmd = (
+                    "sftp://" in cmd_lower
+                    or "scp://" in cmd_lower
+                    or "copy syslogs" in cmd_lower
+                    or "copy core:" in cmd_lower
+                    or "copy crashinfo:" in cmd_lower
+                    or "copy support-bundle" in cmd_lower
+                )
                 if is_transfer_cmd:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
+                    _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
                     ftp_user = self.ini.get("FTP", "ftp_user", "")
                     ftp_pasw = self.ini.get("FTP", "ftp_pasw", "")
                     out = self.run_command_interactive(conn, actual_cmd, ftp_user=ftp_user, ftp_pass=ftp_pasw)
-                    # Write the final AP output line to the log file
                     exit_msg = ""
                     for line in reversed(out.strip().splitlines()):
                         line = line.strip()
@@ -1075,20 +1142,28 @@ class PollerEngine:
                             exit_msg = line
                             break
                     _safe_write_append(fname, f"\n[IMAGE DOWNLOAD] Result: {exit_msg}\n")
+                    continue
 
-                elif needs_confirm:
+                # ================================
+                # 🔥 NORMAL COMMANDS
+                # ================================
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
+
+                _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
+
+                if needs_confirm:
                     conn.write_channel(actual_cmd + "\n")
                     time.sleep(3)
                     conn.write_channel("y\n")
                     time.sleep(2)
                     out = conn.read_channel()
-
                 else:
-                    # Use longer timeout for archive/image download commands
-                    _timeout = 3600 if "archive download-sw" in cmd_lower else 180
-                    out = self._ap_send_command(conn, actual_cmd,read_timeout=_timeout)
+                    out = self._ap_send_command(conn, actual_cmd, read_timeout=180)
 
                 _safe_write_append(fname, out + "\n")
+
+                
 
             conn.disconnect()
 
