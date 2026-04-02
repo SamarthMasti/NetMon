@@ -621,12 +621,27 @@ class PollerEngine:
             self._log(f"[AUTH] F1 MACs: {f1}")
 
             # ---------------- WAIT ----------------
+            # ---------------- WAIT ----------------
             self._log("[AUTH] Waiting 15 minutes...")
-            time.sleep(900)
+            conn.disconnect()  # release before sleeping
 
+            elapsed = 0
+            sleep_secs = 900
+            heartbeat_interval = 30
+            while elapsed < sleep_secs:
+                if self._shutdown_event.is_set():
+                    return []
+                chunk = min(heartbeat_interval, sleep_secs - elapsed)
+                time.sleep(chunk)
+                elapsed += chunk
+                if elapsed < sleep_secs:
+                    self._log(f"[AUTH] Still waiting... {elapsed}s / {sleep_secs}s") # interruptible sleep
+            
             # ---------------- STEP 2 ----------------
-            self._log(f"[AUTH][CMD] {cmd1}")
+            self._log("[AUTH] Reconnecting after wait...")
+            conn = self._wlc_connect(section)  # fresh connection
 
+            self._log(f"[AUTH][CMD] {cmd1}")
             out2 = conn.send_command(cmd1)
 
             self._log(f"[AUTH][RAW F2]\n{out2}")
