@@ -322,7 +322,7 @@ def analyze_logs(log_dir: str):
         recovery_option_partition_safe_but_clean_up_reccomended
     ])
 
-
+    output_file = ""
     if status_rows:
 
         folder_name = os.path.basename(log_dir)
@@ -435,7 +435,8 @@ def analyze_logs(log_dir: str):
         )
 
     summary_text = "\n".join(summary_lines)
-
+    if not output_file:
+        return [], ""
     summary_filename = output_file
 
 

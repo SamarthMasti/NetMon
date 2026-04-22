@@ -26,7 +26,7 @@ from PollerEngine import PollerEngine
 from PollerEngine import decrypt_value, encrypt_value
 from PySide6.QtGui import QColor
 APP_NAME = "CISCO WLAN POLLER GUI"
-APP_VERSION = "v5.06"
+APP_VERSION = "v5.08"
 try:
     from ApFlashVulnerableChecker import analyze_logs
 except ImportError as e:
@@ -411,11 +411,14 @@ class PollerWorker(QThread):
                 # 🔥 NEW WORKFLOW
                 if self.workflow == "Client Stuck In Auth Loop":
 
+                    engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
                     delete_list = engine.run_client_auth_workflow()
+                    
+                    
 
                     summary["delete_list"] = delete_list
                     summary["clients_detected"] = len(delete_list)
-
+                    summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
                     self.log.emit("")
                     self.log.emit("=" * 50)
                     self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
@@ -446,7 +449,10 @@ class PollerWorker(QThread):
                 return
 
             # --- AP Only ---
-            if self.operation_type == "AP Only" and self.ap_list_file:
+            if self.operation_type == "AP Only":
+
+                if not self.ap_list_file or not os.path.exists(self.ap_list_file):
+                    raise ValueError(f"AP list file missing: {self.ap_list_file}")
 
                 ap_rows = []
 
@@ -514,6 +520,28 @@ class PollerWorker(QThread):
             if self.operation_type == "WLC & AP":
                 import threading
                 from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+                # Safety redirect: if cronjob saved wrong operation_type, catch it here
+                if self.workflow == "Client Stuck In Auth Loop":
+                    engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
+                    delete_list = engine.run_client_auth_workflow()
+                    summary["delete_list"] = delete_list
+                    summary["clients_detected"] = len(delete_list)
+                    summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
+                    self.log.emit("")
+                    self.log.emit("=" * 50)
+                    self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
+                    self.log.emit("=" * 50)
+                    self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
+                    if delete_list:
+                        for mac in delete_list:
+                            self.log.emit(f" Deauthenticated: {mac}")
+                    else:
+                        self.log.emit(" No clients stuck in auth loop")
+                    self.log.emit("=" * 50)
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+                    return
 
                 wlc_sections = engine._get_wlc_sections_list()
                 # ── Headless guard: verify ap_cmds are not empty before starting ──
@@ -612,7 +640,12 @@ class PollerWorker(QThread):
                     engine.write_filtered_ap_list(all_filtered)
 
                 if not all_filtered:
-                    raise ValueError("Filtered AP list is empty.")
+                    self.log.emit("[WORKER] Warning: Filtered AP list is empty — no APs to poll.")
+                    summary.update({"ap_total": 0, "ap_success": 0, "ap_failed": 0,
+                                    "data_dir": engine.data_dir})
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+                    return
 
                 # ---- Flash checker analysis ----
                 if (self.workflow == "AP Flash Checker" and analyze_logs and
@@ -711,8 +744,10 @@ class MainWindow(QMainWindow):
         self.ap_list_file = ""
         self.ap_list_path = ""
         self.run_count = 0
-        self.headless_mode = False  # set True when launched with --run-profile
-        self.wlc_cmds: List[str] = []   # multi-WLC list
+        self.headless_mode = False
+        self.enable_debug_collection = False
+        self.wlc_cmds: List[str] = []
+        self.ap_cmds: List[str] = []    # multi-WLC list
         if IniStore:
             self.ini = IniStore(CONFIG_FILE)
         else:
@@ -869,177 +904,160 @@ class MainWindow(QMainWindow):
             self.run_log.append("\n".join(header_block))
         except Exception:
             pass
-    def _load_profile_and_run(self):
-        import json
-        profile_path = CONFD_DIR / "run_profile.json"
+    def _load_and_run_cronjob(self):
+        """Load CRONJOB config + load commands from files (NOT config.ini) and auto-run."""
 
-        if not profile_path.exists():
-            print(f"[HEADLESS] ERROR: No profile found at {profile_path}")
-            QApplication.quit()
+        if not self.ini or not self.ini.cfg.has_option("CRONJOB", "operation_type"):
             return
 
+        g = lambda k, d="": self.ini.cfg.get("CRONJOB", k, fallback=d)
+
+        # ---------------- BASIC CONFIG ----------------
+        self.operation_type = g("operation_type", "WLC & AP")
+        self.workflow        = g("workflow", "Custom CLI Commands")
+        self.ap_mode         = g("ap_mode", "AP Custom Cmd List")
+        self.ap_filter_mode  = g("ap_filter_mode", "NONE")
+        self.site_tag        = g("site_tag", "")
+        self.model_group     = g("model_group", "All AP Models")
+        self.ap_device              = g("ap_device", "cos_qca")
+        self.enable_debug_collection = False  # now controlled by counter, not UI toggle
+
+        # Safety: Client Stuck In Auth Loop is always WLC Only — fix mis-saved cronjob
+        if self.workflow == "Client Stuck In Auth Loop":
+            self.operation_type = "WLC Only"
+       # ---------------- AP LIST FILE RESOLUTION ----------------
+        # ---------------- AP LIST FILE RESOLUTION (FIXED) ----------------
+        self.ap_list_file = g("ap_list_file", "") or \
+                            self.ini.cfg.get("GENERAL", "last_ap_list_file", fallback="")
+
+        if not self.ap_list_file:
+            print("[CRONJOB] ERROR: AP list file not set")
+
+        else:
+            # Convert to absolute path
+            if not os.path.isabs(self.ap_list_file):
+                self.ap_list_file = os.path.join(BASE_DIR, self.ap_list_file)
+
+            # ✅ PRIMARY CHECK
+            if not os.path.exists(self.ap_list_file):
+
+                # ✅ FALLBACK TO ENGINE LOCATION
+                fallback = os.path.join(CONFD_DIR, "ap_ip_list.txt")
+
+                if os.path.exists(fallback):
+                    print(f"[CRONJOB] Using fallback AP list: {fallback}")
+                    self.ap_list_file = fallback
+
+                else:
+                    print(f"[CRONJOB] ERROR: AP list not found anywhere")
+                    print(f"[CRONJOB] Tried: {self.ap_list_file}")
+                    print(f"[CRONJOB] Tried fallback: {fallback}")
+
+            print(f"[CRONJOB] FINAL AP list file: {self.ap_list_file}")
+        # ---------------- LOAD COMMANDS FROM FILES ----------------
+        def _load_cmds(path):
+            if not os.path.exists(path):
+                print(f"[CRONJOB] File not found: {path}")
+                return []
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return [line.strip() for line in f if line.strip()]
+
+        wlc_file = os.path.join(CONFD_DIR, "wlc_cmds.txt")
+        ap_file  = os.path.join(CONFD_DIR, "ap_cmds.txt")
+
+        self.wlc_cmds = _load_cmds(wlc_file)
+        self.ap_cmds  = _load_cmds(ap_file)
+
+        print(f"[CRONJOB] Loaded commands from files")
+        print(f"[CRONJOB] WLC cmds count = {len(self.wlc_cmds)}")
+        print(f"[CRONJOB] AP cmds count  = {len(self.ap_cmds)}")
+
+        # ---------------- VALIDATION ----------------
+        
+
+        # ---------------- SYNC UI ----------------
         try:
-            with open(str(profile_path), "r", encoding="utf-8") as f:
-                profile = json.load(f)
-        except Exception as e:
-            print(f"[HEADLESS] ERROR: Failed to load profile: {e}")
-            QApplication.quit()
-            return
-
-        # Restore state from profile
-        self.operation_type  = profile.get("operation_type",  "WLC & AP")
-        self.workflow        = profile.get("workflow",         "Custom CLI Commands")
-        self.ap_mode         = profile.get("ap_mode",          "AP Custom Cmd List")
-        self.ap_filter_mode  = profile.get("ap_filter_mode",   "NONE")
-        self.site_tag        = profile.get("site_tag",          "")
-        self.model_group     = profile.get("model_group",       "All AP Models")
-        self.ap_device       = profile.get("ap_device",         "cos_qca")
-        self.ap_list_file    = profile.get("ap_list_file",      "")
-        self.ap_list_path    = self.ap_list_file
-        self.wlc_cmds        = profile.get("wlc_cmds",          [])
-        self.ap_cmds         = profile.get("ap_cmds",           [])
-
-        print(f"[HEADLESS] Profile loaded: op={self.operation_type} workflow={self.workflow}")
-
-        # ── Sync operation dropdown so _on_operation_change fires correctly ──
-        try:
-            if hasattr(self, "op_dd"):
-                idx = {"WLC Only": 0, "WLC & AP": 1, "AP Only": 2}.get(self.operation_type, 1)
-                self.op_dd.blockSignals(True)
-                self.op_dd.setCurrentIndex(idx)
-                self.op_dd.blockSignals(False)
+            if hasattr(self, "wlc_cmd_box"):
+                self.wlc_cmd_box.setPlainText("\n".join(self.wlc_cmds))
         except Exception:
             pass
 
-        # ── Rebuild WLC entries to match what is in config.ini ──
-        # Credentials live only in config.ini (never in the profile).
-        # We need the wlc_entries widgets filled so _save_creds_silent works.
         try:
-            if self.ini and self.operation_type in ("WLC Only", "WLC & AP"):
-                # Collect all WLC sections that have an IP set
-                wlc_sections = []
-                for sec in self.ini.cfg.sections():
-                    if sec == "WLC" or (sec.startswith("WLC") and sec[3:].isdigit()):
-                        if self.ini.get(sec, "wlc_ip"):
-                            wlc_sections.append(sec)
-                wlc_sections.sort(key=lambda s: 0 if s == "WLC" else int(s[3:]))
+            if hasattr(self, "ap_cmd_box"):
+                self.ap_cmd_box.setPlainText("\n".join(self.ap_cmds))
+        except Exception:
+            pass
 
-                # Remove all existing entries except the first placeholder
-                while len(self.wlc_entries) > 0:
-                    entry = self.wlc_entries.pop()
-                    try:
-                        entry["widget"].setParent(None)
-                        entry["widget"].deleteLater()
-                    except Exception:
-                        pass
+        # ---------------- SYNC OPERATION DROPDOWN ----------------
+        try:
+            idx = {"WLC Only": 0, "WLC & AP": 1, "AP Only": 2}.get(self.operation_type, 1)
+            self.op_dd.blockSignals(True)
+            self.op_dd.setCurrentIndex(idx)
+            self.op_dd.blockSignals(False)
+        except Exception:
+            pass
 
-                # Re-add one entry per WLC section found in ini
-                for sec in wlc_sections:
-                    self._add_wlc_entry()
+        # ---------------- LOAD WLC CREDENTIALS ----------------
+        try:
+            wlc_secs = []
+            for sec in self.ini.cfg.sections():
+                if sec == "WLC" or (sec.startswith("WLC") and sec[3:].isdigit()):
+                    if self.ini.get(sec, "wlc_ip"):
+                        wlc_secs.append(sec)
 
-                # Fill in the credentials from ini
-                for i, sec in enumerate(wlc_sections):
-                    if i < len(self.wlc_entries):
-                        self.wlc_entries[i]["ip"].setText(self.ini.get(sec, "wlc_ip"))
-                        self.wlc_entries[i]["user"].setText(self.ini.get(sec, "wlc_user"))
-                        self.wlc_entries[i]["pasw"].setText(self.ini.get(sec, "wlc_pasw"))
-                        print(f"[HEADLESS] Loaded creds for {sec}: {self.ini.get(sec, 'wlc_ip')}")
+            wlc_secs.sort(key=lambda s: 0 if s == "WLC" else int(s[3:]))
+
+            # Clear UI
+            while self.wlc_entries:
+                e = self.wlc_entries.pop()
+                try:
+                    e["widget"].deleteLater()
+                except Exception:
+                    pass
+
+            # Rebuild UI
+            for _ in wlc_secs:
+                self._add_wlc_entry()
+
+            for i, sec in enumerate(wlc_secs):
+                if i < len(self.wlc_entries):
+                    self.wlc_entries[i]["ip"].setText(self.ini.get(sec, "wlc_ip"))
+                    self.wlc_entries[i]["user"].setText(self.ini.get(sec, "wlc_user"))
+                    self.wlc_entries[i]["pasw"].setText(self.ini.get(sec, "wlc_pasw"))
 
         except Exception as e:
-            print(f"[HEADLESS] Warning: could not rebuild WLC entries: {e}")
+            print(f"[CRONJOB] WLC rebuild failed: {e}")
 
-        # ── Fill AP credential widgets ──
+        # ---------------- LOAD AP CREDS ----------------
         try:
-            if self.ini and self.operation_type in ("WLC & AP", "AP Only"):
+            if self.operation_type in ("WLC & AP", "AP Only"):
                 if hasattr(self, "ap_user"):
                     self.ap_user.setText(self.ini.get("AP", "ap_user"))
                 if hasattr(self, "ap_pass"):
                     self.ap_pass.setText(self.ini.get("AP", "ap_pasw"))
                 if hasattr(self, "ap_enable"):
                     self.ap_enable.setText(self.ini.get("AP", "ap_enable"))
-        except Exception as e:
-            print(f"[HEADLESS] Warning: could not load AP creds: {e}")
-
-        # ── Sync workflow dropdown ──
-        # ── Sync workflow dropdown ──
-        # IMPORTANT: save workflow before calling _update_workflow_dropdown
-        # because that method resets self.workflow to index 0 of the dropdown
-        saved_workflow = self.workflow
-        try:
-            self._update_workflow_dropdown()
-            if hasattr(self, "workflow_dd"):
-                idx = self.workflow_dd.findText(saved_workflow)
-                if idx >= 0:
-                    self.workflow_dd.blockSignals(True)
-                    self.workflow_dd.setCurrentIndex(idx)
-                    self.workflow_dd.blockSignals(False)
-                else:
-                    print(f"[HEADLESS] WARNING: workflow '{saved_workflow}' not found in dropdown")
         except Exception:
             pass
-        # Force restore workflow state after dropdown sync (dropdown signals may have changed it)
-        self.workflow = saved_workflow
-        print(f"[HEADLESS] workflow restored to: '{self.workflow}'")
 
-        print(f"[HEADLESS] Starting run automatically...")
-        # ── Verification: log what will be used ──
-        print(f"[HEADLESS] wlc_entries count: {len(self.wlc_entries)}")
-        for i, e in enumerate(self.wlc_entries):
-            print(f"[HEADLESS]   WLC{i+1}: ip='{e['ip'].text()}' user='{e['user'].text()}' pasw_len={len(e['pasw'].text())}")
-        print(f"[HEADLESS] wlc_cmds: {self.wlc_cmds}")
-        print(f"[HEADLESS] ap_cmds: {self.ap_cmds}")
-        print(f"[HEADLESS] ap_list_file: '{self.ap_list_file}'")
-        print(f"[HEADLESS] operation_type: '{self.operation_type}'")
-        # ── Sync WLC cmd box so _start_run reads commands correctly ──────────
+        # ---------------- WORKFLOW DROPDOWN ----------------
         try:
-            if hasattr(self, "wlc_cmd_box") and self.wlc_cmds:
-                self.wlc_cmd_box.blockSignals(True)
-                self.wlc_cmd_box.setPlainText("\n".join(self.wlc_cmds))
-                self.wlc_cmd_box.blockSignals(False)
-                print(f"[HEADLESS] wlc_cmd_box populated with {len(self.wlc_cmds)} commands")
-        except Exception as e:
-            print(f"[HEADLESS] Warning: wlc_cmd_box sync failed: {e}")
+            saved_wf = self.workflow
+            self._update_workflow_dropdown()
 
-        # ── Sync AP cmd box so _start_run reads commands correctly ───────────
-        try:
-            if hasattr(self, "ap_cmd_box") and self.ap_cmds:
-                self.ap_cmd_box.blockSignals(True)
-                self.ap_cmd_box.setPlainText("\n".join(self.ap_cmds))
-                self.ap_cmd_box.blockSignals(False)
-                print(f"[HEADLESS] ap_cmd_box populated with {len(self.ap_cmds)} commands")
-        except Exception as e:
-            print(f"[HEADLESS] Warning: ap_cmd_box sync failed: {e}")
-        # ── Force reload ini so engine picks up freshly written credentials ──
-        try:
-            if self.ini:
-                self.ini.cfg.read(str(CONFD_DIR / "config.ini"), encoding="utf-8")
-                print(f"[HEADLESS] config.ini reloaded")
-                # Verify WLC sections exist
-                for sec in self.ini.cfg.sections():
-                    if sec == "WLC" or (sec.startswith("WLC") and sec[3:].isdigit()):
-                        print(f"[HEADLESS] INI section [{sec}]: ip={self.ini.get(sec, 'wlc_ip')}")
-        except Exception as e:
-            print(f"[HEADLESS] Warning: ini reload failed: {e}")
+            idx = self.workflow_dd.findText(saved_wf)
+            if idx >= 0:
+                self.workflow_dd.blockSignals(True)
+                self.workflow_dd.setCurrentIndex(idx)
+                self.workflow_dd.blockSignals(False)
+
+            self.workflow = saved_wf
+        except Exception:
+            pass
+
+        # ---------------- START RUN ----------------
+        print("[CRONJOB] Auto-starting run...")
         QTimer.singleShot(500, self._start_run)
-        
-    def _save_run_log_headless(self):
-        """Silently save run log to data/ folder — used in headless mode."""
-        try:
-            folder = DATA_DIR
-            os.makedirs(folder, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fn = os.path.join(folder, f"WlanPoller_HeadlessLog_{ts}.txt")
-            txt = ""
-            if hasattr(self, "run_log") and self.run_log is not None:
-                try:
-                    txt = self.run_log.toPlainText()
-                except Exception:
-                    txt = ""
-            with open(fn, "w", encoding="utf-8") as f:
-                f.write(txt)
-            print(f"[HEADLESS] Log saved to: {fn}")
-        except Exception as e:
-            print(f"[HEADLESS] Log save failed: {e}")
     def _build_per_wlc_cmd_boxes(self):
 
         layout = self.per_wlc_cmd_section.layout()
@@ -1075,6 +1093,7 @@ class MainWindow(QMainWindow):
             self.per_wlc_cmd_boxes[f"WLC{i+1}"] = cmd_box
 
             # load saved
+            section_name = f"WLC{i+1}"
             if self.ini and self.ini.cfg.has_section(f"{section_name}_CMDS"):
                 raw = self.ini.cfg.get(f"{section_name}_CMDS", "cmds", fallback="")
                 cmd_box.setPlainText(raw)
@@ -1347,7 +1366,9 @@ class MainWindow(QMainWindow):
         self.upload_config_widget.setVisible(False)
 
         c_l.addWidget(self.upload_config_widget)
+
         
+
         c_l.addSpacing(6)
 
         # Add the card to page layout
@@ -1641,13 +1662,11 @@ class MainWindow(QMainWindow):
         confirm.setProperty("nav", True)
         confirm.clicked.connect(self._start_run)
 
-        # ── "Run Periodically" checkbox ──────────────────────
-        self.chk_run_periodically = QCheckBox("Save as Scheduled Profile")
-        self.chk_run_periodically.setStyleSheet("font-size:11px; color:#374151;")
+        
 
         row.addWidget(back)
         row.addStretch()
-        row.addWidget(self.chk_run_periodically)
+        
         row.addWidget(confirm)
 
         lay.addLayout(row)
@@ -1801,7 +1820,34 @@ class MainWindow(QMainWindow):
 
         self.btn_view_logs = QPushButton("View Logs (Open Folder)", clicked=self._open_data_folder)
         self.btn_view_logs.setProperty("nav", True)
+        self.chk_save_cronjob = QCheckBox("Save as CronJob")
+        self.chk_save_cronjob.setStyleSheet("font-size:11px; color:#374151;")
+        self.chk_save_cronjob.setToolTip(
+            "Save this workflow to config.ini.\n"
+            "Next time you launch the app it will auto-run this workflow."
+        )
+        # ✅ Trigger immediately on check — not deferred to _start_run
+        self.chk_save_cronjob.stateChanged.connect(
+            lambda state: self._save_cronjob() if state else None
+        )
 
+        self.chk_delete_cronjob = QCheckBox("Delete CronJob")
+        self.chk_delete_cronjob.setStyleSheet("font-size:11px; color:#dc2626;")
+        self.chk_delete_cronjob.setToolTip("Remove saved CronJob from config.ini")
+
+        # Trigger immediately when checked (same pattern as save)
+        self.chk_delete_cronjob.stateChanged.connect(
+            lambda state: self._delete_cronjob() if state else None
+        )
+        self.chk_collect_again = QCheckBox("Collect Archive + WNCD Core again")
+        self.chk_collect_again.setStyleSheet("font-size:11px; color:#0369a1;")
+        self.chk_collect_again.setToolTip(
+            "Resets the archive + WNCD core collection counter to 0.\n"
+            "The next two workflow runs will collect archive + core files again."
+        )
+        self.chk_collect_again.stateChanged.connect(
+            lambda state: self._reset_collect_counter() if state else None
+        )
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.close)
         self.btn_close.setProperty("nav", True)
@@ -1810,6 +1856,9 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.btn_export_vuln)
         actions.addWidget(self.btn_view_logs)
         actions.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        actions.addWidget(self.chk_collect_again)
+        actions.addWidget(self.chk_delete_cronjob)
+        actions.addWidget(self.chk_save_cronjob)
         actions.addWidget(self.btn_close)
         lay.addLayout(actions)
 
@@ -2104,10 +2153,16 @@ class MainWindow(QMainWindow):
                         print("[HEADLESS] _save_creds_silent: no WLC IPs in widgets, skipping ini rewrite")
                     else:
                         # CLEAR OLD WLC SECTIONS (important to avoid stale entries)
+                        # Only clear and rewrite if ALL entries have IPs (prevents corruption)
+                        all_have_ip = all(
+                            e["ip"].text().strip()
+                            for e in self.wlc_entries
+                            if e["ip"].text().strip()  # at least one non-empty
+                        )
+                        # CLEAR OLD WLC SECTIONS (important to avoid stale entries)
                         for sec in list(self.ini.cfg.sections()):
                             if sec.startswith("WLC"):
                                 self.ini.cfg.remove_section(sec)
-
                         # WRITE EACH WLC AS ITS OWN SECTION
                         for i, e in enumerate(self.wlc_entries):
                             ip = e["ip"].text().strip()
@@ -2134,39 +2189,153 @@ class MainWindow(QMainWindow):
             self.ini.save()
         except Exception:
             pass
-    def _save_run_profile(self):
+    def _save_cronjob(self):
+        """Save current run configuration into [CRONJOB] section of config.ini.
+        Only operation_type and workflow are written to the ini file.
+        All other runtime state is kept in memory only in self._cronjob_state.
         """
-        Save current run configuration to confd/run_profile.json.
-        Credentials stay in config.ini — never duplicated here.
-        """
-        import json
+        if not self.ini:
+            return
         try:
-            profile = {
-                "operation_type":  getattr(self, "operation_type", "WLC & AP"),
-                "workflow":        getattr(self, "workflow", "Custom CLI Commands"),
-                "ap_mode":         getattr(self, "ap_mode", "AP Custom Cmd List"),
-                "ap_filter_mode":  getattr(self, "ap_filter_mode", "NONE"),
-                "site_tag":        getattr(self, "site_tag", ""),
-                "model_group":     getattr(self, "model_group", "All AP Models"),
-                "ap_device":       getattr(self, "ap_device", "cos_qca"),
+            wlc_cmds = getattr(self, "wlc_cmds", [])
+            ap_cmds  = getattr(self, "ap_cmds",  [])
+
+            if hasattr(self, "wlc_cmd_box"):
+                box = [l.strip() for l in self.wlc_cmd_box.toPlainText().splitlines() if l.strip()]
+                if box:
+                    wlc_cmds = box
+            if hasattr(self, "ap_cmd_box"):
+                box = [l.strip() for l in self.ap_cmd_box.toPlainText().splitlines() if l.strip()]
+                if box:
+                    ap_cmds = box
+
+            # Keep full runtime state in memory only
+            self._cronjob_state = {
+                "operation_type": self.operation_type,
+                "workflow":        self.workflow,
+                "ap_mode":         self.ap_mode,
+                "ap_filter_mode":  self.ap_filter_mode,
+                "site_tag":        self.site_tag,
+                "model_group":     self.model_group,
+                "ap_device":       self.ap_device,
                 "ap_list_file":    getattr(self, "ap_list_file", ""),
-                "wlc_cmds":        getattr(self, "wlc_cmds", []),
-                "ap_cmds":         getattr(self, "ap_cmds", []),
+                "wlc_cmds":        wlc_cmds,
+                "ap_cmds":         ap_cmds,
             }
-            profile_path = CONFD_DIR / "run_profile.json"
-            with open(str(profile_path), "w", encoding="utf-8") as f:
-                json.dump(profile, f, indent=2)
+            try:
+                for i, e in enumerate(getattr(self, "wlc_entries", [])):
+                    ip = e["ip"].text().strip()
+                    if ip:
+                        sec = "WLC" if i == 0 else f"WLC{i+1}"
+                        self._cronjob_state[f"cred_{sec}_ip"]   = ip
+                        self._cronjob_state[f"cred_{sec}_user"] = e["user"].text().strip()
+                        self._cronjob_state[f"cred_{sec}_pasw"] = e["pasw"].text().strip()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "ap_user"):
+                    self._cronjob_state["cred_ap_user"]   = self.ap_user.text().strip()
+                    self._cronjob_state["cred_ap_pasw"]   = self.ap_pass.text().strip()
+                    self._cronjob_state["cred_ap_enable"] = self.ap_enable.text().strip()
+            except Exception:
+                pass
+
+            # Write ONLY operation_type and workflow to the ini file
+            if not self.ini.cfg.has_section("CRONJOB"):
+                self.ini.cfg.add_section("CRONJOB")
+
+            # Strip any verbose keys left over from previous saves
+            for k in [
+                "ap_mode", 
+                "ap_device", "wlc_cmds", "ap_cmds",
+                "cred_wlc_ip", "cred_wlc_user", "cred_wlc_pasw",
+                "cred_wlc2_ip", "cred_wlc2_user", "cred_wlc2_pasw",
+                "cred_wlc3_ip", "cred_wlc3_user", "cred_wlc3_pasw",
+                "cred_ap_user", "cred_ap_pasw", "cred_ap_enable",
+            ]:
+                if self.ini.cfg.has_option("CRONJOB", k):
+                    self.ini.cfg.remove_option("CRONJOB", k)
+
+            self.ini.cfg.set("CRONJOB", "operation_type",          self.operation_type)
+            self.ini.cfg.set("CRONJOB", "workflow",                self.workflow)
+            self.ini.cfg.set("CRONJOB", "ap_filter_mode",          getattr(self, "ap_filter_mode", "NONE"))
+            self.ini.cfg.set("CRONJOB", "site_tag",        getattr(self, "site_tag", ""))
+            self.ini.cfg.set("CRONJOB", "model_group",     getattr(self, "model_group", "All AP Models"))
+            self.ini.cfg.set("CRONJOB", "ap_list_file",    getattr(self, "ap_list_file", ""))
+            # Initialize counter only if not already present (preserve existing count)
+            if not self.ini.cfg.has_option("CRONJOB", "collect_archive_wnccore_count"):
+                self.ini.cfg.set("CRONJOB", "collect_archive_wnccore_count", "0")
+            if self.ini.cfg.has_section("ACTIVE_WORKFLOW"):
+                self.ini.cfg.remove_section("ACTIVE_WORKFLOW")
+            self.ini.save()
+            # =========================
+            # SAVE COMMANDS TO FILE (THIS IS THE MISSING LINK)
+            # =========================
+            try:
+                os.makedirs(CONFD_DIR, exist_ok=True)
+
+                wlc_file = os.path.join(CONFD_DIR, "wlc_cmds.txt")
+                ap_file  = os.path.join(CONFD_DIR, "ap_cmds.txt")
+
+                with open(wlc_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(wlc_cmds))
+
+                with open(ap_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(ap_cmds))
+
+                print("[CRONJOB] Commands saved to files")
+
+            except Exception as e:
+                print(f"[CRONJOB ERROR] Failed to save commands: {e}")
             if not getattr(self, "headless_mode", False):
                 QMessageBox.information(
-                    self,
-                    "Profile Saved",
-                    f"Scheduled profile saved to:\n{profile_path}\n\n"
-                    f"To run automatically, point Windows Task Scheduler or cron to:\n"
-                    f"  WlanPollerGUI.exe --run-profile\n"
-                    f"  (or: python WlanPollerGUI.py --run-profile)"
+                    self, "CronJob Saved",
+                    "Workflow saved to config.ini.\n\n"
+                    "The next time you launch WlanPollerGUI it will automatically run this workflow."
                 )
         except Exception as e:
-            print(f"[PROFILE] Failed to save run profile: {e}")
+            print(f"[CRONJOB] Save failed: {e}")
+
+    def _delete_cronjob(self):
+        """Remove [CRONJOB] section from config.ini."""
+        if not self.ini:
+            return
+        if not self.ini.cfg.has_section("CRONJOB"):
+            QMessageBox.information(self, "No CronJob", "No saved CronJob found in config.ini.")
+            return
+        reply = QMessageBox.question(
+            self, "Delete CronJob",
+            "Remove the saved CronJob?\n\nThe app will no longer auto-run on next launch.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.ini.cfg.remove_section("CRONJOB")
+            if self.ini.cfg.has_section("ACTIVE_WORKFLOW"):
+                self.ini.cfg.remove_section("ACTIVE_WORKFLOW")
+            self.ini.save()
+            QMessageBox.information(self, "Deleted", "CronJob removed from config.ini.")
+    def _reset_collect_counter(self):
+        """Reset collect_archive_wnccore_count to 0 in config.ini."""
+        if not self.ini:
+            return
+        try:
+            if not self.ini.cfg.has_section("CRONJOB"):
+                self.ini.cfg.add_section("CRONJOB")
+            self.ini.cfg.set("CRONJOB", "collect_archive_wnccore_count", "0")
+            self.ini.save()
+            QMessageBox.information(
+                self,
+                "Counter Reset",
+                "Archive + WNCD Core collection counter reset to 0.\n\n"
+                "The next two workflow runs will collect archive and core files again."
+            )
+            # Uncheck after confirming so user can click again later
+            if hasattr(self, "chk_collect_again"):
+                self.chk_collect_again.blockSignals(True)
+                self.chk_collect_again.setChecked(False)
+                self.chk_collect_again.blockSignals(False)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to reset counter: {e}")
     def _on_worker_log(self, text):
         """Append worker log and touch last_progress_time so watchdog knows worker is alive."""
         try:
@@ -2268,12 +2437,7 @@ class MainWindow(QMainWindow):
             self._save_creds_silent()
         except Exception:
             pass
-         # Save scheduled profile if checkbox is ticked
-        try:
-            if hasattr(self, "chk_run_periodically") and self.chk_run_periodically.isChecked():
-                self._save_run_profile()
-        except Exception:
-            pass
+         # CronJob is saved immediately on checkbox toggle (see _page_step7)
         self.ap_name_map = {}
         # Pre-populate name map so AP Only 2-column files (IP Name) display correctly
         if self.operation_type == "AP Only" and getattr(self, "ap_list_file", ""):
@@ -2354,6 +2518,7 @@ class MainWindow(QMainWindow):
             )
             self.worker.enable_tmp_cleanup = getattr(self, "enable_tmp_cleanup", False)
             self.worker.enable_reload = getattr(self, "enable_reload", False)
+            self.worker.enable_debug_collection = getattr(self, "enable_debug_collection", False)
         except Exception as e:
             QMessageBox.critical(self, "Worker Error", f"Failed to create worker: {e}")
             return
@@ -2454,8 +2619,7 @@ class MainWindow(QMainWindow):
                     if hasattr(self, "btn_close"):
                         self.btn_close.setEnabled(True)
                     self.run_in_progress = False
-                    if getattr(self, "headless_mode", False):
-                        QTimer.singleShot(500, QApplication.quit)
+                    
                 self.worker.failed.connect(_on_fail)
         except Exception:
             pass
@@ -2494,7 +2658,20 @@ class MainWindow(QMainWindow):
                     lines = [l for l in f if l.strip()]
             except Exception as e:
                 print(f"[HEADLESS] Warning: could not pre-read AP list: {e}")
-
+            # Copy AP list file to ap_ip_list_all.txt for AP Only mode
+            try:
+                import shutil
+                dest = os.path.join(CONFD, "ap_ip_list_all.txt")
+                # Only copy if dest doesn't exist or is empty
+                
+                shutil.copy2(self.ap_list_file, dest)
+            except Exception:
+                pass
+        if self.operation_type != "AP Only":
+            try:
+                open(os.path.join(CONFD, "ap_ip_list_all.txt"), "w").close()
+            except Exception:
+                pass
         try:
             start_time = datetime.now().strftime("%H:%M:%S")
 
@@ -2918,7 +3095,24 @@ class MainWindow(QMainWindow):
             except Exception:
                 # last resort: print to console
                 print("Unable to save run log:", e)
-
+    def _save_run_log_headless(self):
+        """Silently save run log to data/ folder — used when cronjob auto-run completes."""
+        try:
+            folder = DATA_DIR
+            os.makedirs(folder, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fn = os.path.join(folder, f"WlanPoller_CronJobLog_{ts}.txt")
+            txt = ""
+            if hasattr(self, "run_log") and self.run_log is not None:
+                try:
+                    txt = self.run_log.toPlainText()
+                except Exception:
+                    txt = ""
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(txt)
+            print(f"[CRONJOB] Log saved to: {fn}")
+        except Exception as e:
+            print(f"[CRONJOB] Log save failed: {e}")
     def _on_ap_mode_changed(self, text: str):
         self.ap_mode = text
         is_image = (text == "AP Image Download")
@@ -3105,6 +3299,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "upload_config_widget"):
             self.upload_config_widget.setVisible(v == "Upload Files from AP")
 
+        
+        
+
         # 🔥 FLASH CHECKER VISIBILITY
         if hasattr(self, "flash_options_widget"):
 
@@ -3281,21 +3478,12 @@ class MainWindow(QMainWindow):
                 delete_list = summary["delete_list"]
 
                 if not delete_list:
-                    QMessageBox.information(self, "Info", "No clients to delete.")
-                    return
-
-                msg = "Ready to delete these clients?\n\n" + "\n".join(delete_list)
-
-                reply = QMessageBox.question(
-                    self,
-                    "Confirm Deauthentication",
-                    msg,
-                    QMessageBox.Yes | QMessageBox.No
-                )
-
-                if reply == QMessageBox.Yes:
                     if hasattr(self, "run_log"):
-                        self.run_log.append("\n[AUTH] User approved deletion\n")
+                        self.run_log.append("[AUTH] No clients to deauthenticate.\n")
+                    # ← NO return here — fall through to auto-save below
+                else:
+                    if hasattr(self, "run_log"):
+                        self.run_log.append("\n[AUTH] Auto-deauthenticating stuck clients...\n")
 
                     engine = PollerEngine(log_cb=lambda m: self.run_log.append(m))
                     engine.deauth_clients(delete_list)
@@ -3303,11 +3491,55 @@ class MainWindow(QMainWindow):
                     if hasattr(self, "run_log"):
                         self.run_log.append("[AUTH] Deauthentication completed\n")
 
-                else:
-                    if hasattr(self, "run_log"):
-                        self.run_log.append("[AUTH] User cancelled deletion\n")
+                    # ---- Auto-save run log — runs whether or not delete_list is empty ----
+                    if getattr(self, "headless_mode", False):
+                        try:
+                            folder = str(summary.get("data_dir", DATA_DIR))
+                            os.makedirs(folder, exist_ok=True)
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            fn = os.path.join(folder, f"client_auth_loop_logs_{ts}.txt")
+                            txt = ""
+                            if hasattr(self, "run_log") and self.run_log is not None:
+                                try:
+                                    txt = self.run_log.toPlainText()
+                                except Exception:
+                                    txt = ""
+                            with open(fn, "w", encoding="utf-8") as _f:
+                                _f.write(txt)
+                            if hasattr(self, "run_log"):
+                                self.run_log.append(f"[AUTH] Run log auto-saved to: {fn}")
+                        except Exception as _e:
+                            if hasattr(self, "run_log"):
+                                self.run_log.append(f"[AUTH] Auto-save failed: {_e}")
 
-                return
+                                if hasattr(self, "run_log"):
+                                    self.run_log.append("\n[AUTH] Auto-deauthenticating stuck clients...\n")
+
+                                engine = PollerEngine(log_cb=lambda m: self.run_log.append(m))
+                                engine.deauth_clients(delete_list)
+
+                                if hasattr(self, "run_log"):
+                                    self.run_log.append("[AUTH] Deauthentication completed\n")
+
+                # ---- Auto-save run log for Client Auth Loop workflow ----
+                try:
+                    folder = str(summary.get("data_dir", DATA_DIR))
+                    os.makedirs(folder, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fn = os.path.join(folder, f"client_auth_loop_logs_{ts}.txt")
+                    txt = ""
+                    if hasattr(self, "run_log") and self.run_log is not None:
+                        try:
+                            txt = self.run_log.toPlainText()
+                        except Exception:
+                            txt = ""
+                    with open(fn, "w", encoding="utf-8") as _f:
+                        _f.write(txt)
+                    if hasattr(self, "run_log"):
+                        self.run_log.append(f"[AUTH] Run log auto-saved to: {fn}")
+                except Exception as _e:
+                    if hasattr(self, "run_log"):
+                        self.run_log.append(f"[AUTH] Auto-save failed: {_e}")
 
             # ---------------- VULNERABLE TABLE ----------------
             if hasattr(self, "vuln_table"):
@@ -3478,22 +3710,7 @@ class MainWindow(QMainWindow):
                         break
 
 
-            # ---------------- UNLOCK UI ----------------
-            if hasattr(self, "sidebar"):
-                try:
-                    self.sidebar.setEnabled(True)
-                except Exception:
-                    pass
-
-            # Re-enable Close button if present
-            if hasattr(self, "btn_close"):
-                try:
-                    self.btn_close.setEnabled(True)
-                except Exception:
-                    pass
-            if status_file:
-                self.last_status_file = summary.get("status_summary_file", "")
-
+           
         except Exception as e:
             if hasattr(self, "run_log"):
                 try:
@@ -3517,17 +3734,44 @@ class MainWindow(QMainWindow):
             self.run_in_progress = False
 
             # Auto-quit in headless mode after run completes
-            if getattr(self, "headless_mode", False):
-                print("[HEADLESS] Run complete. Saving log and exiting.")
+            if getattr(self, "headless_mode", False) and win.ini.cfg.has_section("CRONJOB"):
+                print("[HEADLESS] Run complete. Staying on Step7 for user review.")
                 try:
                     self._save_run_log_headless()
                 except Exception:
                     pass
-                QTimer.singleShot(1000, QApplication.quit)
-
+                # Stay on Step7 — user decides via Delete CronJob button whether to keep it
+                try:
+                    if hasattr(self, "sidebar"):
+                        self.sidebar.setEnabled(True)
+                except Exception:
+                    pass
+                        
         except Exception:
             pass
+    def _save_auth_log_file(self):
+        try:
+            if not hasattr(self, "run_log"):
+                return
 
+            txt = self.run_log.toPlainText().strip()
+            if not txt:
+                self.run_log.append("[AUTH] No content to save")
+                return
+
+            folder = DATA_DIR
+            os.makedirs(folder, exist_ok=True)
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fn = os.path.join(folder, f"client_auth_loop_logs_{ts}.txt")
+
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(txt)
+
+            self.run_log.append(f"[AUTH] Run log saved to: {fn}")
+
+        except Exception as e:
+            self.run_log.append(f"[AUTH] Save failed: {e}")
     def _on_ap_update(self, *args):
         # ✅ SAFE UNPACKING (handles both 4 and 6 args)
 
@@ -3664,15 +3908,24 @@ class MainWindow(QMainWindow):
             lines.append("Workflow: Client Stuck In Auth Loop")
             lines.append("")
             lines.append("Operation Summary:")
-            lines.append("- Detect clients stuck in 'Authenticating' state")
-            lines.append("- Compare client list over 2 intervals")
-            lines.append("- Identify persistent auth loop clients")
-            lines.append("- Deauthenticate affected clients automatically")
+            lines.append("- Detect clients stuck in 'Authenticating' state by:")
+            lines.append("    1. Compare client list over 2 intervals (15 mins apart)")
+            lines.append("    2. Identify persistent/common clients stuck in Authenticating state")
+            lines.append("- Collect debugs including Archive & WNCD Core")
+            lines.append("- Dump 'show wireless client mac detail' for clients to be deleted/recovered to file")
+            lines.append("- Recover the client by deauthenticating affected clients automatically")
             lines.append("")
             lines.append("Commands Used:")
             lines.append("1. show wireless client summary | include Authenticating")
-            lines.append("2. show wireless client mac <mac> detail")
-            lines.append("3. wireless client mac-address <mac> deauthenticate")
+            lines.append("2. Sleep for 15 mins")
+            lines.append("3. show wireless client summary | include Authenticating")
+            lines.append("4. Take the common clients in above 2 samples to prepare the delete list")
+
+            lines.append("5. request platform software trace archive last 1 hour target bootflash:<file>")
+            lines.append("6. request platform software process core wncd 0 chassis active r0")
+
+            lines.append("7. show wireless client mac-address <mac> detail  (for each client in delete list)")
+            lines.append("8. wireless client mac-address <mac> deauthenticate")
         # ---------------- CLI COMMANDS  (MERGED) ----------------
         wlc_cmds = []
         ap_cmds = []
@@ -4168,19 +4421,7 @@ def resource_path(relpath: str) -> str:
     return os.path.join(base, relpath)
 
 
-# FIND:
-def main():
-    app = QApplication(sys.argv)
-    apply_global_style(app)
-    app.setWindowIcon(QIcon(resource_path("assets/ciscologo.ico")))
-    win = MainWindow()
-    # ensure worker stop when the app quits (in case user closes app from other places)
-    app.aboutToQuit.connect(win._stop_worker)
-    win.show()
-    if "--run-profile" in sys.argv:
-            win.headless_mode = True
-            win._load_profile_and_run()
-    sys.exit(app.exec())
+
 
 # REPLACE WITH:
 def main():
@@ -4189,18 +4430,17 @@ def main():
     app.setWindowIcon(QIcon(resource_path("assets/ciscologo.ico")))
     win = MainWindow()
     app.aboutToQuit.connect(win._stop_worker)
+    win.show()
 
-    # ── Headless / scheduled mode ──────────────────────────
-    headless = "--run-profile" in sys.argv or "--headless" in sys.argv
-    if headless:
+    # ── Auto-run saved CronJob if present in config.ini ──
+    if win.ini and win.ini.cfg.has_section("CRONJOB"):
         win.headless_mode = True
-        win.show()   # window must be visible for Qt widgets to work
-        print("[HEADLESS] WlanPoller launched in scheduled/headless mode")
-        QTimer.singleShot(200, win._load_profile_and_run)
-    else:
-        win.show()
+        print("[CRONJOB] CronJob found in config.ini — auto-starting...")
+        QTimer.singleShot(300, win._load_and_run_cronjob)
 
     sys.exit(app.exec())
+
+
 
 
 if __name__ == "__main__":

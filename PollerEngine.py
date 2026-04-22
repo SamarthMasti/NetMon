@@ -248,6 +248,12 @@ class IniStore:
         if "scp_port" not in self.cfg["FTP"]:
             self.cfg["FTP"]["scp_port"] = "22"
             changed = True
+        # Only add counter if CRONJOB section already exists (user saved a cronjob)
+        # Do NOT create CRONJOB section here — that would trigger headless mode on every launch
+        if "CRONJOB" in self.cfg:
+            if "collect_archive_wnccore_count" not in self.cfg["CRONJOB"]:
+                self.cfg["CRONJOB"]["collect_archive_wnccore_count"] = "0"
+                changed = True
         if changed:
             self.save()
 
@@ -404,6 +410,8 @@ class PollerEngine:
         self.data_dir = str(run_path)
         # ------------------------------------------------------------------
         self.ini = IniStore(str(CONFD / "config.ini"))
+        # Global counter for archive+core collection (max 2)
+        self._collect_counter_key = ("CRONJOB", "collect_archive_wnccore_count")
         self.log_cb = log_cb
         self.progress_cb = progress_cb
         self.ap_update_cb = ap_update_cb
@@ -419,6 +427,8 @@ class PollerEngine:
         self.operation = "WLC & AP"
         self.workflow = ""
         print("DEBUG DATA DIR:", self.data_dir)
+        
+                    
         print("DEBUG BASE DIR:", BASE_DIR)
     def _log(self, msg: str):
         if self.log_cb:
@@ -442,7 +452,13 @@ class PollerEngine:
                 r.wlc_ip = self.ini.get(section, "wlc_ip")
 
             self._log(f"[WLC] Completed {section} ({len(rows)} APs)")
-
+            try:
+                all_path = os.path.join(str(CONFD), "ap_ip_list_all.txt")
+                with open(all_path, "a", encoding="utf-8") as _f:
+                    for r in rows:
+                        _f.write(f"{r.ip} {r.model} {r.name}\n")
+            except Exception as _e:
+                self._log(f"[ENGINE] ap_ip_list_all write failed: {_e}")
             return rows
 
         except Exception as e:
@@ -599,7 +615,7 @@ class PollerEngine:
     def run_client_auth_workflow(self):
 
         delete_list = []
-
+        self._progress(5)
         wlc_sections = self._get_wlc_sections()
 
         for section in wlc_sections:
@@ -609,11 +625,11 @@ class PollerEngine:
             conn = self._wlc_connect(section)
 
             # ---------------- STEP 1 ----------------
-            cmd1 = "show wireless client summary"
+            cmd1 = "show wireless client summary | include Authenticating"
             self._log(f"[AUTH][CMD] {cmd1}")
 
             out1 = conn.send_command(cmd1)
-
+            self._progress(20)
             self._log(f"[AUTH][RAW F1]\n{out1}")
 
             f1 = self._extract_macs(out1)
@@ -643,7 +659,7 @@ class PollerEngine:
 
             self._log(f"[AUTH][CMD] {cmd1}")
             out2 = conn.send_command(cmd1)
-
+            self._progress(65)
             self._log(f"[AUTH][RAW F2]\n{out2}")
 
             f2 = self._extract_macs(out2)
@@ -652,7 +668,7 @@ class PollerEngine:
 
             # ---------------- INTERSECTION ----------------
             stuck = list(set(f1).intersection(set(f2)))
-
+            self._progress(75)
             self._log(f"[AUTH] Persistent clients: {stuck}")
 
             # ---------------- DETAIL CHECK ----------------
@@ -683,8 +699,48 @@ class PollerEngine:
 
             conn.disconnect()
 
-        self._log(f"[AUTH] FINAL DELETE LIST: {delete_list}")
+        # ---- Show detail for every MAC in delete_list before deletion proceeds ----
+        if delete_list:
+            self._log("\n[AUTH] ===== CLIENT DETAIL (PRE-DELETION) =====")
+            for section in wlc_sections:
+                try:
+                    conn = self._wlc_connect(section)
+                    for mac in delete_list:
+                        cmd = f"show wireless client mac-address {mac} detail"
+                        self._log(f"[AUTH][PRE-DELETE CMD] {cmd}")
+                        out = conn.send_command(cmd)
+                        self._log(f"[AUTH][PRE-DELETE DETAIL]\n{out}")
+                    conn.disconnect()
+                except Exception as e:
+                    self._log(f"[AUTH] Pre-delete detail fetch failed ({section}): {e}")
+            self._log("[AUTH] ===== END OF PRE-DELETE DETAILS =====\n")
 
+        self._log(f"[AUTH] FINAL DELETE LIST: {delete_list}")
+        # ---- Save deleted MACs to timestamped file ----
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            mac_file = os.path.join(self.data_dir, f"deleted_clients_{ts}.txt")
+            with open(mac_file, "w", encoding="utf-8") as _mf:
+                _mf.write(f"Auth Loop Deleted Clients — {datetime.now().isoformat()}\n")
+                _mf.write("=" * 50 + "\n")
+                for _mac in delete_list:
+                    _mf.write(f"{_mac}\n")
+            self._log(f"[AUTH] Deleted MACs saved to: {mac_file}")
+        except Exception as _e:
+            self._log(f"[AUTH] Failed to save MAC file: {_e}")
+
+        # ---- Optional debug collection (archive + WNCD core) ----
+        # ---- Debug collection (archive + WNCD core) — always attempted, gated by counter ----
+        if delete_list:
+            current_count = self._get_collect_counter()
+            self._log(f"[DEBUG] collect_archive_wnccore_count = {current_count}")
+            if current_count < 2:
+                self._increment_collect_counter()
+                self._log(f"[DEBUG] Proceeding with archive + core collection (run {current_count + 1}/2)")
+                self._run_auth_debug_collection(wlc_sections, ts)
+            else:
+                self._log(f"[DEBUG] Skipping archive + core collection — already collected 2 times (count={current_count}). Use 'Collect again' checkbox in Step7 to reset.")
+        self._progress(100)
         return delete_list
     def _extract_macs(self, output):
         macs = []
@@ -709,6 +765,80 @@ class PollerEngine:
                 conn.send_command(f"wireless client mac-address {mac} deauthenticate")
 
             conn.disconnect()
+
+    def _run_auth_debug_collection(self, wlc_sections: list, ts: str):
+        """
+        Collect archive traces and WNCD core dump after auth loop detection.
+        Called only when enable_debug_collection=True.
+        Success detection strings taken from verified WLC output:
+          Archive : "Done with creation of the archive file:"
+          Core    : "SUCCESS: Core file generated."
+        """
+        for section in wlc_sections:
+            try:
+                self._log(f"[DEBUG] ===== Collecting debugs for [{section}] =====")
+                conn = self._wlc_connect(section)
+
+                # ---- 1. Archive logs (1 hour, timestamped filename) ----
+                archive_fname = f"auth_issue_{ts}.tar.gz"
+                archive_cmd = (
+                    f"request platform software trace archive last 1 hour "
+                    f"target bootflash:{archive_fname}"
+                )
+                self._log(f"[DEBUG][ARCHIVE] Running: {archive_cmd}")
+                archive_out = conn.send_command(archive_cmd, read_timeout=300)
+                self._log(f"[DEBUG][ARCHIVE OUTPUT]\n{archive_out}")
+
+                if "Done with creation of the archive file" in archive_out:
+                    self._log(
+                        f"[DEBUG][ARCHIVE] SUCCESS — bootflash:{archive_fname}"
+                    )
+                else:
+                    self._log(
+                        f"[DEBUG][ARCHIVE] ERROR — expected 'Done with creation of "
+                        f"the archive file' not found. Check output above."
+                    )
+
+                # ---- 2. WNCD core dump ----
+                core_cmd = "request platform software process core wncd 0 chassis active r0"
+                self._log(f"[DEBUG][CORE] Running: {core_cmd}")
+                core_out = conn.send_command(core_cmd, read_timeout=300)
+                self._log(f"[DEBUG][CORE OUTPUT]\n{core_out}")
+
+                if "SUCCESS: Core file generated." in core_out:
+                    self._log("[DEBUG][CORE] SUCCESS — Core file generated.")
+                else:
+                    self._log(
+                        "[DEBUG][CORE] ERROR — expected 'SUCCESS: Core file generated.' "
+                        "not found. Check output above."
+                    )
+
+                conn.disconnect()
+                self._log(f"[DEBUG] Debug collection complete for [{section}]")
+
+            except Exception as _e:
+                self._log(f"[DEBUG] Debug collection failed ({section}): {_e}")
+
+    def _get_collect_counter(self) -> int:
+        """Read collect_archive_wnccore_count from config.ini. Returns 0 if missing."""
+        try:
+            val = self.ini.cfg.get("CRONJOB", "collect_archive_wnccore_count", fallback="0")
+            return int(val)
+        except Exception:
+            return 0
+
+    def _increment_collect_counter(self):
+        """Increment counter in config.ini (capped at 2)."""
+        try:
+            current = self._get_collect_counter()
+            new_val = min(current + 1, 99)  # no artificial cap on storage, logic caps at 2
+            if not self.ini.cfg.has_section("CRONJOB"):
+                self.ini.cfg.add_section("CRONJOB")
+            self.ini.cfg.set("CRONJOB", "collect_archive_wnccore_count", str(new_val))
+            self.ini.save()
+            self._log(f"[DEBUG] collect_archive_wnccore_count updated: {current} → {new_val}")
+        except Exception as e:
+            self._log(f"[DEBUG] Failed to update collect counter: {e}")
     def fetch_full_ap_list(self) -> List[ApRow]:
         self._log("[WLC] Parallel fetch_full_ap_list() starting...")
 
