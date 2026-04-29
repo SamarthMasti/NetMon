@@ -10,9 +10,10 @@ import sys
 import socket
 import re
 from datetime import datetime
+import time
 from typing import List, Optional
 from pathlib import Path
-from time import time
+
 from PySide6.QtWidgets import QHeaderView
 from PySide6.QtCore import Qt, QSize, QThread, QTimer, Signal
 from PySide6.QtGui import QFont, QPixmap, QIcon
@@ -353,6 +354,9 @@ class PollerWorker(QThread):
             ap_device: str,
             ap_list_file: str = "",
             ap_mode: str = "AP Custom Cmd List",
+            iterations_enabled: bool = False,
+            iteration_count:    int  = 1,
+            iteration_interval: int  = 300,
     ):
         super().__init__()
         self.operation_type = operation_type
@@ -365,357 +369,389 @@ class PollerWorker(QThread):
         self.ap_device = ap_device
         self.ap_list_file = ap_list_file
         self.ap_mode = ap_mode
+        self.iterations_enabled  = iterations_enabled
+        self.iteration_count     = max(1, min(50, iteration_count))
+        self.iteration_interval  = max(0, min(18000, iteration_interval))
     def run(self):
-        engine = None
+        iterations = self.iteration_count if self.iterations_enabled else 1
+
+        for _iter in range(iterations):
+
+            # ── Iteration header ─────────────────────────────────
+            if iterations > 1:
+                self.log.emit(f"\n{'='*54}")
+                self.log.emit(f"[ITERATION] Run {_iter + 1} of {iterations}")
+                self.log.emit(f"{'='*54}\n")
+
+            # ── Existing run body (unchanged, indented one level) ─
+            engine = None
         
-        try:
-            # create engine inside try/except so creation failures are visible
             try:
+                # create engine inside try/except so creation failures are visible
+                try:
 
-                engine = PollerEngine(
-                    log_cb=lambda msg: self.log.emit(msg),
-                    progress_cb=lambda pct: self.progress.emit(pct),
-                   ap_update_cb=lambda i, ip, model, status, name, wlc:
-                    self.ap_update.emit(i, ip, model, status, name, wlc)
-                )
-                engine.operation = self.operation_type
+                    engine = PollerEngine(
+                        log_cb=lambda msg: self.log.emit(msg),
+                        progress_cb=lambda pct: self.progress.emit(pct),
+                    ap_update_cb=lambda i, ip, model, status, name, wlc:
+                        self.ap_update.emit(i, ip, model, status, name, wlc)
+                    )
+                    engine.operation = self.operation_type
 
-                # Only pass workflow to engine when WLC is involved
-                if self.operation_type == "WLC & AP":
-                    engine.workflow = self.workflow
+                    # Only pass workflow to engine when WLC is involved
+                    if self.operation_type == "WLC & AP":
+                        engine.workflow = self.workflow
+                    else:
+                        engine.workflow = ""
+
+                except Exception as e:
+                    try:
+                        self.log.emit(f"PollerWorker: engine creation failed: {e}")
+                    except Exception:
+                        pass
+                    try:
+                        self.failed.emit(str(e))
+                    except Exception:
+                        pass
+                    continue
+
+                try:
+                    self.log.emit("PollerWorker: engine created, starting operation")
+                except Exception:
+                    pass
+
+                start = datetime.now()
+                summary = {"start": start, "operation": self.operation_type}
+
+                # --- WLC Only ---
+                if self.operation_type == "WLC Only":
+
+                    # 🔥 NEW WORKFLOW
+                    if self.workflow == "Client Stuck In Auth Loop":
+
+                        engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
+                        delete_list = engine.run_client_auth_workflow()
+                        
+                        
+
+                        summary["delete_list"] = delete_list
+                        summary["clients_detected"] = len(delete_list)
+                        summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
+                        self.log.emit("")
+                        self.log.emit("=" * 50)
+                        self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
+                        self.log.emit("=" * 50)
+                        self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
+
+                        if delete_list:
+                            for mac in delete_list:
+                                self.log.emit(f" Deauthenticated: {mac}")
+                        else:
+                            self.log.emit(" No clients stuck in auth loop")
+
+                        self.log.emit("=" * 50)
+
+                        summary["end"] = datetime.now()
+                        self.finished_ok.emit(summary)
+                        return
+
+                    # OLD FLOW
+                    
+                    if not self.wlc_cmds:
+                        raise ValueError("WLC Cmd List is empty.")
+
+                    out = engine.run_wlc_cmds(self.wlc_cmds)
+                    summary.update({"wlc_output": out})
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+                    
+
+                # --- AP Only ---
+                elif self.operation_type == "AP Only":
+
+                    if not self.ap_list_file or not os.path.exists(self.ap_list_file):
+                        raise ValueError(f"AP list file missing: {self.ap_list_file}")
+
+                    ap_rows = []
+
+                    with open(self.ap_list_file, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s:
+                                continue
+
+                            parts = [p.strip() for p in (s.split(",") if "," in s else s.split())]
+
+                            ip, model, name = normalize_ap_entry(parts)
+
+                            if ip:
+                                ap_rows.append(ApRow(ip=ip, model=model, name=name))
+                    if not ap_rows:
+                        raise ValueError("AP list file is empty.")
+
+                    if not self.ap_cmds:
+                        raise ValueError("AP Cmd List is empty.")
+
+                    self.log.emit(f"[DEBUG] Parsed AP rows: {len(ap_rows)}")
+                    self.log.emit(f"[DEBUG] AP list file path = {self.ap_list_file}")
+                    engine.run_ap_poller(ap_rows, self.ap_device, self.ap_cmds, ap_mode=self.ap_mode)
+
+                    summary.update({
+                        "ap_total": len(ap_rows),
+                        "ap_success": engine.success,
+                        "ap_failed": engine.failed,
+                        "data_dir": getattr(engine, "data_dir", ""),
+                        "workflow": self.workflow
+                    })
+
+                    # AP COUNT SUMMARY
+                    self.log.emit("")
+                    self.log.emit("=" * 56)
+                    self.log.emit("  AP COUNT SUMMARY")
+                    self.log.emit("=" * 56)
+                    self.log.emit(f"  Total APs in file   : {len(ap_rows)}")
+                    self.log.emit(f"  APs processed       : {len(ap_rows)}")
+                    self.log.emit(f"  Success             : {engine.success}")
+                    self.log.emit(f"  Failed              : {engine.failed}")
+                    self.log.emit("=" * 56)
+
+                    # THEN vulnerability analysis
+                    if (
+                        self.workflow == "AP Flash Checker"
+                        and analyze_logs
+                        and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))):
+                        self.log.emit("")
+                        self.log.emit("=" * 56)
+                        self.log.emit("  RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
+                        self.log.emit("  Please wait — scanning AP output logs.")
+                        self.log.emit("=" * 56)
+                        self.progress.emit(0)
+                        vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
+                        summary["vulnerable_rows"] = vuln_rows
+                        self.log.emit(f"  Susceptibility scan complete. Found: {len(vuln_rows)} Susceptible AP(s)")
+                        self.log.emit("=" * 56)
+                        self.progress.emit(100)
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+                    
+                # --- WLC & AP ---
+                elif self.operation_type == "WLC & AP":
+                    import threading
+                    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+                    # Safety redirect: if cronjob saved wrong operation_type, catch it here
+                    if self.workflow == "Client Stuck In Auth Loop":
+                        engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
+                        delete_list = engine.run_client_auth_workflow()
+                        summary["delete_list"] = delete_list
+                        summary["clients_detected"] = len(delete_list)
+                        summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
+                        self.log.emit("")
+                        self.log.emit("=" * 50)
+                        self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
+                        self.log.emit("=" * 50)
+                        self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
+                        if delete_list:
+                            for mac in delete_list:
+                                self.log.emit(f" Deauthenticated: {mac}")
+                        else:
+                            self.log.emit(" No clients stuck in auth loop")
+                        self.log.emit("=" * 50)
+                        summary["end"] = datetime.now()
+                        self.finished_ok.emit(summary)
+                        return
+
+                    wlc_sections = engine._get_wlc_sections_list()
+                    # ── Headless guard: verify ap_cmds are not empty before starting ──
+                    if not self.ap_cmds:
+                        raise ValueError(
+                            "[WLC & AP] AP Cmd List is empty. "
+                            "Check that run_profile.json contains ap_cmds and the profile was saved correctly."
+                        )
+                    self.log.emit(f"[WORKER] WLC sections found: {wlc_sections}")
+                    self.log.emit(f"[WORKER] AP commands to run: {self.ap_cmds}")
+                    self.log.emit(f"[WORKER] WLC commands to run: {self.wlc_cmds}")
+                    if not wlc_sections:
+                        raise ValueError(
+                            "[WLC & AP] No WLC sections found in config.ini. "
+                            "Credentials may not have been saved correctly."
+                        )
+                    all_filtered = []
+                    all_filtered_lock = threading.Lock()
+                    _summary_lock = threading.Lock()
+
+                    total_success = 0
+                    total_failed = 0
+                    _count_lock = threading.Lock()
+
+                    def _process_one_wlc(section):
+                        """Fetch APs from one WLC, apply filters, then immediately poll those APs."""
+
+                        # ---- Step 1: Run WLC commands ----
+                        if self.wlc_cmds:
+                            engine._run_wlc_cmds_for_section(section, self.wlc_cmds)
+                    
+                        # ---- Step 2: Fetch AP list ----
+                        rows = engine._fetch_ap_list_for_section(section)
+
+                        # ---- Step 3: Apply filters ----
+                        local_total = len(rows)
+                        site_tag_used = ""
+
+                        if self.ap_filter_mode == "SITE":
+                            rows, local_total = engine._filter_by_site_tag_section(
+                                section, rows, self.site_tag
+                            )
+                            site_tag_used = self.site_tag
+                        elif self.ap_filter_mode == "MODEL":
+                            rows = engine.filter_by_model_group(rows, self.model_group)
+
+                        with _summary_lock:
+                            if self.ap_filter_mode == "SITE":
+                                summary["TotalApCnt"] = summary.get("TotalApCnt", 0) + local_total
+                                summary["SiteTagNameFilter"] = self.site_tag
+
+                        if not rows:
+                            self.log.emit(
+                                f"[WORKER] {section}: AP list is EMPTY. "
+                                f"'show ap summary' returned 0 APs or WLC SSH failed. "
+                                f"Check WLC connectivity and credentials in config.ini."
+                            )
+                            return 0, 0
+
+                        # ---- Step 4: Write filtered list (thread-safe append) ----
+                        with all_filtered_lock:
+                            all_filtered.extend(rows)
+
+                        # ---- Step 5: Poll APs for THIS WLC immediately (parallel within WLC) ----
+                        self.log.emit(
+                            f"[WORKER] {section}: starting AP polling for {len(rows)} APs..."
+                        )
+                        s, f = engine.run_ap_poller(rows, self.ap_device, self.ap_cmds)
+                        self.log.emit(
+                            f"[WORKER] {section}: AP polling done. Success={s} Failed={f}"
+                        )
+                        return s, f
+
+                    # ---- Run all WLCs in parallel ----
+                    self.log.emit(
+                        f"[WORKER] Starting {len(wlc_sections)} WLC(s) in parallel..."
+                    )
+
+                    with ThreadPoolExecutor(max_workers=len(wlc_sections)) as wlc_executor:
+                        wlc_futures = {
+                            wlc_executor.submit(_process_one_wlc, sec): sec
+                            for sec in wlc_sections
+                        }
+                        for fut in _as_completed(wlc_futures):
+                            sec = wlc_futures[fut]
+                            try:
+                                s, f = fut.result()
+                                with _count_lock:
+                                    total_success += s
+                                    total_failed += f
+                            except Exception as e:
+                                self.log.emit(f"[WORKER] {sec} failed: {e}")
+
+                    # ---- Write combined filtered list after all WLCs done ----
+                    if all_filtered:
+                        engine.write_filtered_ap_list(all_filtered)
+
+                    if not all_filtered:
+                        self.log.emit("[WORKER] Warning: Filtered AP list is empty — no APs to poll.")
+                        summary.update({"ap_total": 0, "ap_success": 0, "ap_failed": 0,
+                                        "data_dir": engine.data_dir})
+                        summary["end"] = datetime.now()
+                        self.finished_ok.emit(summary)
+                        
+                    
+                    # ---- Flash checker analysis ----
+                    elif (self.workflow == "AP Flash Checker" and analyze_logs and
+                            not (getattr(self, "enable_tmp_cleanup", False) or
+                                getattr(self, "enable_reload", False))):
+                        self.log.emit("=" * 56)
+                        self.log.emit(" RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
+                        self.progress.emit(0)
+                        vuln_rows, _ = analyze_logs(str(engine.data_dir))
+                        summary["vulnerable_rows"] = vuln_rows
+                        self.log.emit(
+                            f"  Scan complete. Found: {len(vuln_rows)} susceptible AP(s)"
+                        )
+                        self.progress.emit(100)
+
+                    summary.update({
+                        "ap_total": len(all_filtered),
+                        "ap_success": total_success,
+                        "ap_failed": total_failed,
+                        "data_dir": engine.data_dir,
+                        "TotalApCnt": summary.get("TotalApCnt", len(all_filtered)),
+                    })
+                    summary["end"] = datetime.now()
+                    self.finished_ok.emit(summary)
+
+                    
                 else:
-                    engine.workflow = ""
+                    raise ValueError("Unknown operation.")
+
 
             except Exception as e:
+
+                import traceback
+
+                traceback.print_exc()
+
                 try:
-                    self.log.emit(f"PollerWorker: engine creation failed: {e}")
+
+                    self.log.emit(f"[ERROR] {str(e)}")
+
                 except Exception:
+
                     pass
+
                 try:
+
                     self.failed.emit(str(e))
+
+                except Exception:
+
+                    pass
+
+
+
+            finally:
+                # cleanup engine if it exposes shutdown/close
+                try:
+                    if engine is not None:
+                        if hasattr(engine, "shutdown") and callable(getattr(engine, "shutdown")):
+                            try:
+                                engine.shutdown()
+                            except Exception:
+                                pass
+                        if hasattr(engine, "close") and callable(getattr(engine, "close")):
+                            try:
+                                engine.close()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
-                return
-
-            try:
-                self.log.emit("PollerWorker: engine created, starting operation")
-            except Exception:
-                pass
-
-            start = datetime.now()
-            summary = {"start": start, "operation": self.operation_type}
-
-            # --- WLC Only ---
-            if self.operation_type == "WLC Only":
-
-                # 🔥 NEW WORKFLOW
-                if self.workflow == "Client Stuck In Auth Loop":
-
-                    engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
-                    delete_list = engine.run_client_auth_workflow()
-                    
-                    
-
-                    summary["delete_list"] = delete_list
-                    summary["clients_detected"] = len(delete_list)
-                    summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
-                    self.log.emit("")
-                    self.log.emit("=" * 50)
-                    self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
-                    self.log.emit("=" * 50)
-                    self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
-
-                    if delete_list:
-                        for mac in delete_list:
-                            self.log.emit(f" Deauthenticated: {mac}")
-                    else:
-                        self.log.emit(" No clients stuck in auth loop")
-
-                    self.log.emit("=" * 50)
-
-                    summary["end"] = datetime.now()
-                    self.finished_ok.emit(summary)
-                    return
-
-                # OLD FLOW
-                
-                if not self.wlc_cmds:
-                    raise ValueError("WLC Cmd List is empty.")
-
-                out = engine.run_wlc_cmds(self.wlc_cmds)
-                summary.update({"wlc_output": out})
-                summary["end"] = datetime.now()
-                self.finished_ok.emit(summary)
-                return
-
-            # --- AP Only ---
-            if self.operation_type == "AP Only":
-
-                if not self.ap_list_file or not os.path.exists(self.ap_list_file):
-                    raise ValueError(f"AP list file missing: {self.ap_list_file}")
-
-                ap_rows = []
-
-                with open(self.ap_list_file, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        s = line.strip()
-                        if not s:
-                            continue
-
-                        parts = [p.strip() for p in (s.split(",") if "," in s else s.split())]
-
-                        ip, model, name = normalize_ap_entry(parts)
-
-                        if ip:
-                            ap_rows.append(ApRow(ip=ip, model=model, name=name))
-                if not ap_rows:
-                    raise ValueError("AP list file is empty.")
-
-                if not self.ap_cmds:
-                    raise ValueError("AP Cmd List is empty.")
-
-                self.log.emit(f"[DEBUG] Parsed AP rows: {len(ap_rows)}")
-                self.log.emit(f"[DEBUG] AP list file path = {self.ap_list_file}")
-                engine.run_ap_poller(ap_rows, self.ap_device, self.ap_cmds, ap_mode=self.ap_mode)
-
-                summary.update({
-                    "ap_total": len(ap_rows),
-                    "ap_success": engine.success,
-                    "ap_failed": engine.failed,
-                    "data_dir": getattr(engine, "data_dir", ""),
-                    "workflow": self.workflow
-                })
-
-                # AP COUNT SUMMARY
-                self.log.emit("")
-                self.log.emit("=" * 56)
-                self.log.emit("  AP COUNT SUMMARY")
-                self.log.emit("=" * 56)
-                self.log.emit(f"  Total APs in file   : {len(ap_rows)}")
-                self.log.emit(f"  APs processed       : {len(ap_rows)}")
-                self.log.emit(f"  Success             : {engine.success}")
-                self.log.emit(f"  Failed              : {engine.failed}")
-                self.log.emit("=" * 56)
-
-                # THEN vulnerability analysis
-                if (
-                    self.workflow == "AP Flash Checker"
-                    and analyze_logs
-                    and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))):
-                    self.log.emit("")
-                    self.log.emit("=" * 56)
-                    self.log.emit("  RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
-                    self.log.emit("  Please wait — scanning AP output logs.")
-                    self.log.emit("=" * 56)
-                    self.progress.emit(0)
-                    vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
-                    summary["vulnerable_rows"] = vuln_rows
-                    self.log.emit(f"  Susceptibility scan complete. Found: {len(vuln_rows)} Susceptible AP(s)")
-                    self.log.emit("=" * 56)
-                    self.progress.emit(100)
-                summary["end"] = datetime.now()
-                self.finished_ok.emit(summary)
-                return
-            # --- WLC & AP ---
-            if self.operation_type == "WLC & AP":
-                import threading
-                from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-
-                # Safety redirect: if cronjob saved wrong operation_type, catch it here
-                if self.workflow == "Client Stuck In Auth Loop":
-                    engine.enable_debug_collection = getattr(self, "enable_debug_collection", False)
-                    delete_list = engine.run_client_auth_workflow()
-                    summary["delete_list"] = delete_list
-                    summary["clients_detected"] = len(delete_list)
-                    summary["data_dir"] = engine.data_dir   # ← ADD THIS LINE
-                    self.log.emit("")
-                    self.log.emit("=" * 50)
-                    self.log.emit(" CLIENT AUTH LOOP SUMMARY ")
-                    self.log.emit("=" * 50)
-                    self.log.emit(f" Total stuck clients detected: {len(delete_list)}")
-                    if delete_list:
-                        for mac in delete_list:
-                            self.log.emit(f" Deauthenticated: {mac}")
-                    else:
-                        self.log.emit(" No clients stuck in auth loop")
-                    self.log.emit("=" * 50)
-                    summary["end"] = datetime.now()
-                    self.finished_ok.emit(summary)
-                    return
-
-                wlc_sections = engine._get_wlc_sections_list()
-                # ── Headless guard: verify ap_cmds are not empty before starting ──
-                if not self.ap_cmds:
-                    raise ValueError(
-                        "[WLC & AP] AP Cmd List is empty. "
-                        "Check that run_profile.json contains ap_cmds and the profile was saved correctly."
-                    )
-                self.log.emit(f"[WORKER] WLC sections found: {wlc_sections}")
-                self.log.emit(f"[WORKER] AP commands to run: {self.ap_cmds}")
-                self.log.emit(f"[WORKER] WLC commands to run: {self.wlc_cmds}")
-                if not wlc_sections:
-                    raise ValueError(
-                        "[WLC & AP] No WLC sections found in config.ini. "
-                        "Credentials may not have been saved correctly."
-                    )
-                all_filtered = []
-                all_filtered_lock = threading.Lock()
-                _summary_lock = threading.Lock()
-
-                total_success = 0
-                total_failed = 0
-                _count_lock = threading.Lock()
-
-                def _process_one_wlc(section):
-                    """Fetch APs from one WLC, apply filters, then immediately poll those APs."""
-
-                    # ---- Step 1: Run WLC commands ----
-                    if self.wlc_cmds:
-                        engine._run_wlc_cmds_for_section(section, self.wlc_cmds)
-                
-                    # ---- Step 2: Fetch AP list ----
-                    rows = engine._fetch_ap_list_for_section(section)
-
-                    # ---- Step 3: Apply filters ----
-                    local_total = len(rows)
-                    site_tag_used = ""
-
-                    if self.ap_filter_mode == "SITE":
-                        rows, local_total = engine._filter_by_site_tag_section(
-                            section, rows, self.site_tag
-                        )
-                        site_tag_used = self.site_tag
-                    elif self.ap_filter_mode == "MODEL":
-                        rows = engine.filter_by_model_group(rows, self.model_group)
-
-                    with _summary_lock:
-                        if self.ap_filter_mode == "SITE":
-                            summary["TotalApCnt"] = summary.get("TotalApCnt", 0) + local_total
-                            summary["SiteTagNameFilter"] = self.site_tag
-
-                    if not rows:
-                        self.log.emit(
-                            f"[WORKER] {section}: AP list is EMPTY. "
-                            f"'show ap summary' returned 0 APs or WLC SSH failed. "
-                            f"Check WLC connectivity and credentials in config.ini."
-                        )
-                        return 0, 0
-
-                    # ---- Step 4: Write filtered list (thread-safe append) ----
-                    with all_filtered_lock:
-                        all_filtered.extend(rows)
-
-                    # ---- Step 5: Poll APs for THIS WLC immediately (parallel within WLC) ----
-                    self.log.emit(
-                        f"[WORKER] {section}: starting AP polling for {len(rows)} APs..."
-                    )
-                    s, f = engine.run_ap_poller(rows, self.ap_device, self.ap_cmds)
-                    self.log.emit(
-                        f"[WORKER] {section}: AP polling done. Success={s} Failed={f}"
-                    )
-                    return s, f
-
-                # ---- Run all WLCs in parallel ----
+            # ── Inter-iteration sleep (skip after last run) ───────
+            if _iter < iterations - 1:
+                wait = self.iteration_interval
                 self.log.emit(
-                    f"[WORKER] Starting {len(wlc_sections)} WLC(s) in parallel..."
+                    f"\n[ITERATION] Run {_iter + 1} complete. "
+                    f"Waiting {wait}s before run {_iter + 2} of {iterations}..."
                 )
-
-                with ThreadPoolExecutor(max_workers=len(wlc_sections)) as wlc_executor:
-                    wlc_futures = {
-                        wlc_executor.submit(_process_one_wlc, sec): sec
-                        for sec in wlc_sections
-                    }
-                    for fut in _as_completed(wlc_futures):
-                        sec = wlc_futures[fut]
-                        try:
-                            s, f = fut.result()
-                            with _count_lock:
-                                total_success += s
-                                total_failed += f
-                        except Exception as e:
-                            self.log.emit(f"[WORKER] {sec} failed: {e}")
-
-                # ---- Write combined filtered list after all WLCs done ----
-                if all_filtered:
-                    engine.write_filtered_ap_list(all_filtered)
-
-                if not all_filtered:
-                    self.log.emit("[WORKER] Warning: Filtered AP list is empty — no APs to poll.")
-                    summary.update({"ap_total": 0, "ap_success": 0, "ap_failed": 0,
-                                    "data_dir": engine.data_dir})
-                    summary["end"] = datetime.now()
-                    self.finished_ok.emit(summary)
-                    return
-
-                # ---- Flash checker analysis ----
-                if (self.workflow == "AP Flash Checker" and analyze_logs and
-                        not (getattr(self, "enable_tmp_cleanup", False) or
-                            getattr(self, "enable_reload", False))):
-                    self.log.emit("=" * 56)
-                    self.log.emit(" RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
-                    self.progress.emit(0)
-                    vuln_rows, _ = analyze_logs(str(engine.data_dir))
-                    summary["vulnerable_rows"] = vuln_rows
-                    self.log.emit(
-                        f"  Scan complete. Found: {len(vuln_rows)} susceptible AP(s)"
-                    )
-                    self.progress.emit(100)
-
-                summary.update({
-                    "ap_total": len(all_filtered),
-                    "ap_success": total_success,
-                    "ap_failed": total_failed,
-                    "data_dir": engine.data_dir,
-                    "TotalApCnt": summary.get("TotalApCnt", len(all_filtered)),
-                })
-                summary["end"] = datetime.now()
-                self.finished_ok.emit(summary)
-                return
-
-            raise ValueError("Unknown operation.")
-
-
-        except Exception as e:
-
-            import traceback
-
-            traceback.print_exc()
-
-            try:
-
-                self.log.emit(f"[ERROR] {str(e)}")
-
-            except Exception:
-
-                pass
-
-            try:
-
-                self.failed.emit(str(e))
-
-            except Exception:
-
-                pass
-
-
-
-        finally:
-            # cleanup engine if it exposes shutdown/close
-            try:
-                if engine is not None:
-                    if hasattr(engine, "shutdown") and callable(getattr(engine, "shutdown")):
-                        try:
-                            engine.shutdown()
-                        except Exception:
-                            pass
-                    if hasattr(engine, "close") and callable(getattr(engine, "close")):
-                        try:
-                            engine.close()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
+                elapsed = 0
+                while elapsed < wait:
+                    chunk = min(30, wait - elapsed)
+                    time.sleep(chunk)
+                    elapsed += chunk
+                    remaining = wait - elapsed
+                    if remaining > 0:
+                        self.log.emit(
+                            f"[ITERATION] {elapsed}s elapsed, {remaining}s remaining..."
+                        )
+                self.log.emit(f"[ITERATION] Wait complete. Starting run {_iter + 2}...\n")
 
 # ---------------- Main Window ----------------
 class MainWindow(QMainWindow):
@@ -744,6 +780,10 @@ class MainWindow(QMainWindow):
         self.ap_list_file = ""
         self.ap_list_path = ""
         self.run_count = 0
+        # ── Iterations ──────────────────────────────────────
+        self.iterations_enabled = False
+        self.iteration_count    = 1
+        self.iteration_interval = 300   # seconds
         self.headless_mode = False
         self.enable_debug_collection = False
         self.wlc_cmds: List[str] = []
@@ -921,7 +961,16 @@ class MainWindow(QMainWindow):
         self.model_group     = g("model_group", "All AP Models")
         self.ap_device              = g("ap_device", "cos_qca")
         self.enable_debug_collection = False  # now controlled by counter, not UI toggle
-
+        # ── Iteration state ──────────────────────────────────────
+        self.iterations_enabled  = g("iterations_enabled", "false").lower() == "true"
+        try:
+            self.iteration_count = max(1, min(50, int(g("iteration_count", "1"))))
+        except Exception:
+            self.iteration_count = 1
+        try:
+            self.iteration_interval = max(0, min(18000, int(g("iteration_interval", "300"))))
+        except Exception:
+            self.iteration_interval = 300
         # Safety: Client Stuck In Auth Loop is always WLC Only — fix mis-saved cronjob
         if self.workflow == "Client Stuck In Auth Loop":
             self.operation_type = "WLC Only"
@@ -1649,6 +1698,107 @@ class MainWindow(QMainWindow):
 
         c_l.addWidget(self.preview_text)
 
+        # ── ITERATION CONFIG as collapsible dropdown ─────────────
+        iter_toggle_btn = QPushButton("▶  Iteration Config (optional)")
+        iter_toggle_btn.setCheckable(True)
+        iter_toggle_btn.setChecked(False)
+        iter_toggle_btn.setStyleSheet("""
+            QPushButton {
+                text-align: left;
+                padding: 6px 12px;
+                background: #f3f4f6;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                font-weight: 600;
+            }
+            QPushButton:checked {
+                background: #e5e7eb;
+            }
+        """)
+
+        iter_body = QWidget()
+        iter_body.setVisible(False)
+        iter_body_layout = QGridLayout(iter_body)
+        iter_body_layout.setContentsMargins(12, 10, 12, 10)
+        iter_body_layout.setHorizontalSpacing(14)
+        iter_body_layout.setVerticalSpacing(6)
+
+        self.chk_iterations = QCheckBox("Enable Iterations")
+        self.chk_iterations.setChecked(self.iterations_enabled)
+        iter_body_layout.addWidget(self.chk_iterations, 0, 0, 1, 2)
+
+        iter_body_layout.addWidget(QLabel("Count (max 50):"), 1, 0)
+        self.iter_count_field = QLineEdit()
+        self.iter_count_field.setFixedWidth(80)
+        self.iter_count_field.setPlaceholderText("0–50")
+        self.iter_count_field.setEnabled(self.iterations_enabled)
+        iter_body_layout.addWidget(self.iter_count_field, 1, 1)
+
+        iter_body_layout.addWidget(QLabel("Interval in seconds max(18000):"), 2, 0)
+        self.iter_interval_field = QLineEdit()
+        self.iter_interval_field.setFixedWidth(80)
+        self.iter_interval_field.setPlaceholderText("1–18000")
+        self.iter_interval_field.setEnabled(self.iterations_enabled)
+        iter_body_layout.addWidget(self.iter_interval_field, 2, 1)
+
+        def _on_iter_toggle(checked):
+            iter_body.setVisible(checked)
+            iter_toggle_btn.setText(
+                ("▼" if checked else "▶") + "  Iteration Config (optional)"
+            )
+
+        iter_toggle_btn.toggled.connect(_on_iter_toggle)
+
+        def _on_iter_chk(state):
+            on = bool(state)
+            self.iter_count_field.setEnabled(on)
+            self.iter_interval_field.setEnabled(on)
+            self._sync_iter_state()
+            self._fill_preview()
+
+        def _sync_and_preview():
+            self._sync_iter_state()
+            self._fill_preview()
+
+        self.chk_iterations.stateChanged.connect(_on_iter_chk)
+        self.iter_count_field.textChanged.connect(lambda _: _sync_and_preview())
+        self.iter_interval_field.textChanged.connect(lambda _: _sync_and_preview())
+        # ── Static compatibility notice ───────────────────────
+        iter_info = QLabel(
+            "<b>Not all workflows support iterations.</b><br>"
+            "The following will automatically disable this feature:<br>"
+            "<ul style='margin:4px 0 0 16px; padding:0;'>"
+            "<li><b>AP Image Download</b> — one-time flash operation; "
+            "re-running risks storage corruption</li>"
+            "<li><b>TMP Cleanup + Reload</b> — APs reboot after this command; "
+            "they will be unreachable during the next iteration window</li>"
+            
+            "and is a one-shot recovery workflow</li>"
+            "<li>Any command containing: <code>reload</code>, "
+            "<code>archive download-sw</code>, <code>sftp://</code>, "
+            "<code>scp://</code></li>"
+            "</ul>"
+        )
+        iter_info.setWordWrap(True)
+        iter_info.setTextFormat(Qt.RichText)
+        iter_info.setStyleSheet(
+            "background: #f0f9ff;"
+            "border: 1px solid #bae6fd;"
+            "border-radius: 6px;"
+            "padding: 8px 12px;"
+            "font-size: 11px;"
+            "color: #0c4a6e;"
+        )
+        iter_body_layout.addWidget(iter_info, 3, 0, 1, 2)
+        # ── END notice ───────────────────────────────────────
+
+        
+
+        c_l.addWidget(iter_toggle_btn)
+        c_l.addWidget(iter_body)
+        # ── END ITERATION CONFIG ─────────────────────────────────
+
         lay.addWidget(card, 1)  # <-- IMPORTANT: stretch factor 1
 
         # -------- BUTTON ROW --------
@@ -1951,7 +2101,10 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 if hasattr(self, "run_log"):
                     self.run_log.append(f"[DEBUG] preview build failed: {e}")
-
+            try:
+                self._check_iter_compatibility()
+            except Exception:
+                pass
     def _on_operation_change(self, value: str):
         self.operation_type = value
 
@@ -2262,6 +2415,11 @@ class MainWindow(QMainWindow):
             self.ini.cfg.set("CRONJOB", "site_tag",        getattr(self, "site_tag", ""))
             self.ini.cfg.set("CRONJOB", "model_group",     getattr(self, "model_group", "All AP Models"))
             self.ini.cfg.set("CRONJOB", "ap_list_file",    getattr(self, "ap_list_file", ""))
+             # ── NEW: Iteration keys ──────────────────────────────
+            self.ini.cfg.set("CRONJOB", "iterations_enabled",  str(getattr(self, "iterations_enabled",  False)).lower())
+            self.ini.cfg.set("CRONJOB", "iteration_count",     str(getattr(self, "iteration_count",     1)))
+            self.ini.cfg.set("CRONJOB", "iteration_interval",  str(getattr(self, "iteration_interval",  300)))
+            
             # Initialize counter only if not already present (preserve existing count)
             if not self.ini.cfg.has_option("CRONJOB", "collect_archive_wnccore_count"):
                 self.ini.cfg.set("CRONJOB", "collect_archive_wnccore_count", "0")
@@ -2341,7 +2499,7 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, "run_log"):
                 self.run_log.append(str(text))
-            self.last_progress_time = time()
+            self.last_progress_time = time.time()
         except Exception:
             pass
 
@@ -2378,7 +2536,7 @@ class MainWindow(QMainWindow):
             )
             effective_timeout = 3600 if is_image_run else timeout_sec
 
-            if last is None or (time() - last) > effective_timeout:
+            if last is None or (time.time() - last) > effective_timeout:
                 if hasattr(self, "run_log"):
                     self.run_log.append(
                         f"[WATCHDOG] No progress or log for {effective_timeout}s. "
@@ -2435,6 +2593,11 @@ class MainWindow(QMainWindow):
         # Silent save
         try:
             self._save_creds_silent()
+        except Exception:
+            pass
+        # ── Sync iteration state from Step6 widgets ──────────────
+        try:
+            self._sync_iter_state()
         except Exception:
             pass
          # CronJob is saved immediately on checkbox toggle (see _page_step7)
@@ -2515,6 +2678,9 @@ class MainWindow(QMainWindow):
                 ap_device=getattr(self, "ap_device", "cos_qca"),
                 ap_list_file=ap_list_file,
                 ap_mode=getattr(self, "ap_mode", "AP Custom Cmd List"),
+                iterations_enabled  = getattr(self, "iterations_enabled",  False),
+                iteration_count     = getattr(self, "iteration_count",     1),
+                iteration_interval  = getattr(self, "iteration_interval",  300),
             )
             self.worker.enable_tmp_cleanup = getattr(self, "enable_tmp_cleanup", False)
             self.worker.enable_reload = getattr(self, "enable_reload", False)
@@ -2524,7 +2690,7 @@ class MainWindow(QMainWindow):
             return
 
         # Prepare watchdog state
-        self.last_progress_time = time()
+        self.last_progress_time = time.time()
         if getattr(self, "watchdog_timer", None) is None:
             self.watchdog_timer = QTimer(self)
             self.watchdog_timer.setInterval(10000)  # check every 10 seconds
@@ -2545,7 +2711,7 @@ class MainWindow(QMainWindow):
                 try:
                     if hasattr(self, "progress"):
                         self.progress.setValue(pct)
-                    self.last_progress_time = time()
+                    self.last_progress_time = time.time()
                 except Exception:
                     pass
 
@@ -2639,7 +2805,7 @@ class MainWindow(QMainWindow):
 
         # Start watchdog and the worker
         try:
-            self.last_progress_time = time()
+            self.last_progress_time = time.time()
             self.watchdog_timer.start()
             self._goto_step(6)
             self._inject_run_preview_into_log()
@@ -3318,6 +3484,7 @@ class MainWindow(QMainWindow):
     # ... (remaining methods: _step3_proceed, _on_ap_mode_changed, _step4_save, _step4_proceed, _enforce_one_filter,
     # _update_ap_device_from_model, _step5_preview are defined earlier in file - kept unchanged for brevity) ...
     # For completeness they are implemented above in the full content.
+        self._check_iter_compatibility()
     def _on_upload_proto_changed(self, proto: str):
         """Show/hide SFTP credential fields in the upload config block."""
         is_sftp = (proto == "SFTP")
@@ -3423,7 +3590,53 @@ class MainWindow(QMainWindow):
 
         self._fill_preview()
         self._goto_step(5)
+    def _sync_iter_state(self):
+        """Read iteration widgets into self.iterations_* state variables."""
+        try:
+            self.iterations_enabled = self.chk_iterations.isChecked()
+        except Exception:
+            self.iterations_enabled = False
+        try:
+            v = int(self.iter_count_field.text().strip())
+            self.iteration_count = max(1, min(50, v))
+        except Exception:
+            self.iteration_count = 1
+        try:
+            v = int(self.iter_interval_field.text().strip())
+            self.iteration_interval = max(0, min(18000, v))
+        except Exception:
+            self.iteration_interval = 300
+    def _check_iter_compatibility(self):
+        """
+        Disable iterations if the current workflow/commands involve
+        image download or reload — these are not safe to repeat.
+        """
+        incompatible_workflows = {"AP Image Download", "TMP Cleanup + reload"}
+        incompatible_cmd_patterns = (
+            "archive download-sw", "sftp://", "scp://", "reload", "%reload%"
+        )
 
+        wf = getattr(self, "workflow", "")
+        ap_cmds = getattr(self, "ap_cmds", [])
+
+        cmd_has_incompatible = any(
+            pat in cmd.lower()
+            for cmd in ap_cmds
+            for pat in incompatible_cmd_patterns
+        )
+
+        should_disable = wf in incompatible_workflows or cmd_has_incompatible
+
+        if hasattr(self, "chk_iterations"):
+            if should_disable:
+                self.chk_iterations.setChecked(False)
+                self.chk_iterations.setEnabled(False)
+                self.chk_iterations.setToolTip(
+                    "Iterations not available for image download or reload workflows."
+                )
+            else:
+                self.chk_iterations.setEnabled(True)
+                self.chk_iterations.setToolTip("")
     def _on_finished(self, summary: dict):
         try:
             # ---------------- BASIC INFO ----------------
@@ -4023,7 +4236,21 @@ class MainWindow(QMainWindow):
                 self.preview_text.setPlainText("\n".join(lines))
             except Exception:
                 pass
+        # ── ITERATION CONFIG ─────────────────────────────────────
+        lines.append("")
+        lines.append(f"{sec}) Iteration Config")
+        lines.append("   " + "-" * 30)
+        enabled = getattr(self, "iterations_enabled", False)
+        lines.append(f"   - Enabled  "       if enabled else "   -Disabled")
+        if enabled:
+            lines.append(f"   - Count          : {getattr(self, 'iteration_count', 1)}")
+            lines.append(f"   - Interval (sec) : {getattr(self, 'iteration_interval', 300)}")
 
+        if hasattr(self, "preview_text"):
+            try:
+                self.preview_text.setPlainText("\n".join(lines))
+            except Exception:
+                pass        
     def _run_parser(self):
         """
         Run parser/search over the most recent 'data' leaf folder.
