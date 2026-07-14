@@ -26,8 +26,9 @@ from PySide6.QtWidgets import (
 from PollerEngine import PollerEngine
 from PollerEngine import decrypt_value, encrypt_value
 from PySide6.QtGui import QColor
+from PollerEngine import DATAPATH_MON_DEFAULT_ITERATIONS, DATAPATH_MON_DEFAULT_INTERVAL_SEC
 APP_NAME = "CISCO WLAN POLLER GUI"
-APP_VERSION = "v5.08"
+APP_VERSION = "v5.09"
 try:
     from ApFlashVulnerableChecker import analyze_logs
 except ImportError as e:
@@ -357,6 +358,7 @@ class PollerWorker(QThread):
             iterations_enabled: bool = False,
             iteration_count:    int  = 1,
             iteration_interval: int  = 300,
+            client_mac: str = "", 
     ):
         super().__init__()
         self.operation_type = operation_type
@@ -372,8 +374,15 @@ class PollerWorker(QThread):
         self.iterations_enabled  = iterations_enabled
         self.iteration_count     = max(1, min(50, iteration_count))
         self.iteration_interval  = max(0, min(18000, iteration_interval))
+        self.client_mac = client_mac           # NEW
     def run(self):
-        iterations = self.iteration_count if self.iterations_enabled else 1
+        # AP Datapath Queue Mon manages its own internal iteration loop
+        # (single SSH session, reused across iterations) — never let the
+        # outer per-run reconnect loop wrap it.
+        if self.workflow == "AP Datapath Queue Mon":
+            iterations = 1
+        else:
+            iterations = self.iteration_count if self.iterations_enabled else 1
 
         for _iter in range(iterations):
 
@@ -489,6 +498,39 @@ class PollerWorker(QThread):
                     if not ap_rows:
                         raise ValueError("AP list file is empty.")
 
+                    if self.workflow == "AP Datapath Queue Mon":
+                        results = engine.run_ap_datapath_queue_monitor(ap_rows)
+                        summary.update({
+                            "ap_total": len(ap_rows),
+                            "ap_success": engine.success,
+                            "ap_failed": engine.failed,
+                            "data_dir": getattr(engine, "data_dir", ""),
+                            "workflow": self.workflow,
+                            "datapath_results": results,
+                        })
+                        self.log.emit("")
+                        self.log.emit("=" * 56)
+                        self.log.emit("  AP DATAPATH QUEUE MONITOR SUMMARY")
+                        self.log.emit("=" * 56)
+                        for r in results:
+                            self.log.emit(f"  {r['ap_name']} ({r['ap_ip']}): {r.get('status')}")
+                            for dp in r.get("datapaths", []):
+                                self.log.emit(
+                                    f"      [{dp.get('datapath_id')}] clients={dp.get('clients')} -> "
+                                    f"{dp.get('overall_assessment', '')}"
+                                )
+                                if dp.get("recommended_recovery"):
+                                    self.log.emit(f"          Recovery: {dp['recommended_recovery']}")
+                        self.log.emit("=" * 56)
+                        self.log.emit(f"  Total APs   : {len(ap_rows)}")
+                        self.log.emit(f"  Success     : {engine.success}")
+                        self.log.emit(f"  Failed      : {engine.failed}")
+                        self.log.emit("=" * 56)
+                        summary["end"] = datetime.now()
+                        self.finished_ok.emit(summary)
+                        return
+
+                    # ---- All other AP Only workflows (unchanged) ----
                     if not self.ap_cmds:
                         raise ValueError("AP Cmd List is empty.")
 
@@ -522,11 +564,34 @@ class PollerWorker(QThread):
                         and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))):
                         self.log.emit("")
                         self.log.emit("=" * 56)
+                        if getattr(self, "test_after_iteration", False):
+                            try:
+                                deletetest_dir = os.path.join(BASE_DIR, "deletetest")
+                                if os.path.isdir(deletetest_dir):
+                                    copied = 0
+                                    for fn in os.listdir(deletetest_dir):
+                                        src = os.path.join(deletetest_dir, fn)
+                                        if os.path.isfile(src):
+                                            import shutil
+                                            shutil.copy2(src, os.path.join(str(summary["data_dir"]), fn))
+                                            copied += 1
+                                    self.log.emit(f"[TEST MODE] Copied {copied} file(s) from deletetest/ into run folder for parsing.")
+                                else:
+                                    self.log.emit("[TEST MODE] deletetest/ folder not found — skipping.")
+                            except Exception as _e:
+                                self.log.emit(f"[TEST MODE] deletetest copy failed: {_e}")
                         self.log.emit("  RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
                         self.log.emit("  Please wait — scanning AP output logs.")
                         self.log.emit("=" * 56)
                         self.progress.emit(0)
                         vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
+                        self.log.emit(f"[FLASH DEBUG] Parser input folder = {summary['data_dir']}")
+
+                        try:
+                            for f in os.listdir(summary["data_dir"]):
+                                self.log.emit(f"[FLASH DEBUG] Found file = {f}")
+                        except Exception as e:
+                            self.log.emit(f"[FLASH DEBUG] Directory read failed: {e}")
                         summary["vulnerable_rows"] = vuln_rows
                         self.log.emit(f"  Susceptibility scan complete. Found: {len(vuln_rows)} Susceptible AP(s)")
                         self.log.emit("=" * 56)
@@ -563,7 +628,7 @@ class PollerWorker(QThread):
 
                     wlc_sections = engine._get_wlc_sections_list()
                     # ── Headless guard: verify ap_cmds are not empty before starting ──
-                    if not self.ap_cmds:
+                    if not self.ap_cmds and self.workflow != "AP Datapath Queue Mon":
                         raise ValueError(
                             "[WLC & AP] AP Cmd List is empty. "
                             "Check that run_profile.json contains ap_cmds and the profile was saved correctly."
@@ -624,6 +689,8 @@ class PollerWorker(QThread):
                             all_filtered.extend(rows)
 
                         # ---- Step 5: Poll APs for THIS WLC immediately (parallel within WLC) ----
+                        if self.workflow == "AP Datapath Queue Mon":          # ← ADD
+                            return 0, 0
                         self.log.emit(
                             f"[WORKER] {section}: starting AP polling for {len(rows)} APs..."
                         )
@@ -664,12 +731,50 @@ class PollerWorker(QThread):
                         summary["end"] = datetime.now()
                         self.finished_ok.emit(summary)
                         
-                    
+                    elif self.workflow == "AP Datapath Queue Mon":            # ← ADD THIS WHOLE BLOCK
+                        self.log.emit(f"[WORKER] Starting AP Datapath Queue Monitor across {len(all_filtered)} AP(s)...")
+                        results = engine.run_ap_datapath_queue_monitor(all_filtered)
+                        summary.update({
+                            "datapath_results": results,
+                            "workflow": self.workflow,
+                        })
+                        self.log.emit("")
+                        self.log.emit("=" * 56)
+                        self.log.emit("  AP DATAPATH QUEUE MONITOR SUMMARY")
+                        self.log.emit("=" * 56)
+                        for r in results:
+                            self.log.emit(f"  {r['ap_name']} ({r['ap_ip']}): {r.get('status')}")
+                            for dp in r.get("datapaths", []):
+                                self.log.emit(
+                                    f"      [{dp.get('datapath_id')}] clients={dp.get('clients')} -> "
+                                    f"{dp.get('overall_assessment', '')}"
+                                )
+                                if dp.get("recommended_recovery"):
+                                    self.log.emit(f"          Recovery: {dp['recommended_recovery']}")
+                        self.log.emit("=" * 56)
+                        total_success = engine.success
+                        total_failed = engine.failed
                     # ---- Flash checker analysis ----
                     elif (self.workflow == "AP Flash Checker" and analyze_logs and
                             not (getattr(self, "enable_tmp_cleanup", False) or
                                 getattr(self, "enable_reload", False))):
                         self.log.emit("=" * 56)
+                        if getattr(self, "test_after_iteration", False):
+                            try:
+                                deletetest_dir = os.path.join(BASE_DIR, "deletetest")
+                                if os.path.isdir(deletetest_dir):
+                                    copied = 0
+                                    for fn in os.listdir(deletetest_dir):
+                                        src = os.path.join(deletetest_dir, fn)
+                                        if os.path.isfile(src):
+                                            import shutil
+                                            shutil.copy2(src, os.path.join(str(engine.data_dir), fn))
+                                            copied += 1
+                                    self.log.emit(f"[TEST MODE] Copied {copied} file(s) from deletetest/ into run folder for parsing.")
+                                else:
+                                    self.log.emit("[TEST MODE] deletetest/ folder not found — skipping.")
+                            except Exception as _e:
+                                self.log.emit(f"[TEST MODE] deletetest copy failed: {_e}")
                         self.log.emit(" RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
                         self.progress.emit(0)
                         vuln_rows, _ = analyze_logs(str(engine.data_dir))
@@ -786,6 +891,7 @@ class MainWindow(QMainWindow):
         self.iteration_interval = 300   # seconds
         self.headless_mode = False
         self.enable_debug_collection = False
+        self.test_after_iteration = False
         self.wlc_cmds: List[str] = []
         self.ap_cmds: List[str] = []    # multi-WLC list
         if IniStore:
@@ -971,6 +1077,7 @@ class MainWindow(QMainWindow):
             self.iteration_interval = max(0, min(18000, int(g("iteration_interval", "300"))))
         except Exception:
             self.iteration_interval = 300
+
         # Safety: Client Stuck In Auth Loop is always WLC Only — fix mis-saved cronjob
         if self.workflow == "Client Stuck In Auth Loop":
             self.operation_type = "WLC Only"
@@ -1231,7 +1338,7 @@ class MainWindow(QMainWindow):
         self.btn_step1_next = QPushButton("Enter Credentials")
         self.btn_step1_next.setProperty("nav", True)  # keep nav styling if desired
         self.btn_step1_next.setFixedHeight(34)
-        self.btn_step1_next.clicked.connect(lambda: self._goto_step(1))
+        self.btn_step1_next.clicked.connect(self._step1_enter_credentials)
         controls.addWidget(self.btn_step1_next)
 
         # Add controls *below* the card (not inside it)
@@ -1240,7 +1347,20 @@ class MainWindow(QMainWindow):
         # Refresh state and return widget
         self._refresh_step1()
         return w
+    def _step1_enter_credentials(self):
+        if self.op_dd.currentText() == "AP Only":
+            if not self.ap_list_file or not os.path.isfile(self.ap_list_file):
+                QMessageBox.warning(
+                    self,
+                    "AP List Required",
+                    "Please upload an AP list file to proceed."
+                )
+                return
 
+        self._goto_step(1)
+
+        
+        
     def _page_step2(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -1513,7 +1633,24 @@ class MainWindow(QMainWindow):
         ap_mode_row.addWidget(self.ap_mode_dd)
         ap_mode_row.addStretch()
         ap_section_layout.addLayout(ap_mode_row)
-
+# ── AP DATAPATH QUEUE MON CONFIG (only for this workflow) ──
+        self.datapath_mon_widget = QWidget()
+        dp_form = QFormLayout(self.datapath_mon_widget)
+        dp_form.setContentsMargins(0, 4, 0, 4)
+        dp_title = QLabel("AP Datapath Queue Monitor")
+        dp_title.setStyleSheet("font-weight:600; color:#0369a1;")
+        dp_form.addRow(dp_title)
+        dp_note = QLabel(
+            f"Runs against ALL clients/Radios/VAPs discovered per-AP via "
+            f"'show client summary' — no MAC entry needed. "
+            f"Collection runs {DATAPATH_MON_DEFAULT_ITERATIONS} iterations, "
+            f"{DATAPATH_MON_DEFAULT_INTERVAL_SEC}s apart (fixed in code)."
+        )
+        dp_note.setWordWrap(True)
+        dp_note.setStyleSheet("color:#6b7280; font-size:11px;")
+        dp_form.addRow(dp_note)
+        self.datapath_mon_widget.setVisible(False)
+        ap_section_layout.addWidget(self.datapath_mon_widget)
         self.ap_cmd_box = QTextEdit()
         self.ap_cmd_box.setPlaceholderText("Enter AP CLI commands (one per line)")
         self.ap_cmd_box.setFixedHeight(160)
@@ -1791,7 +1928,17 @@ class MainWindow(QMainWindow):
             "color: #0c4a6e;"
         )
         iter_body_layout.addWidget(iter_info, 3, 0, 1, 2)
+        
         # ── END notice ───────────────────────────────────────
+        # ── TEST KNOB: Test After Iteration (small, testing-only) ───
+        self.chk_test_after_iteration = QCheckBox("Test mode")
+        self.chk_test_after_iteration.setChecked(getattr(self, "test_after_iteration", False))
+        self.chk_test_after_iteration.setStyleSheet("font-size:10px; color:#9ca3af;")
+        self.chk_test_after_iteration.stateChanged.connect(
+            lambda state: setattr(self, "test_after_iteration", bool(state))
+        )
+        iter_body_layout.addWidget(self.chk_test_after_iteration, 4, 0, 1, 2)
+        # ── END TEST KNOB ─────────────────────────────────────
 
         
 
@@ -1929,20 +2076,26 @@ class MainWindow(QMainWindow):
         vuln_layout.setSpacing(4)
         vuln_layout.addWidget(QLabel("Susceptible APs & Recovery Table"))
 
-        self.vuln_table = QTableWidget(0, 4)
+        self.vuln_table = QTableWidget(0, 6)
         self.vuln_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.vuln_table.setMinimumHeight(100)
         self.vuln_table.verticalHeader().setDefaultSectionSize(32)
-        self.vuln_table.setHorizontalHeaderLabels(["AP Name", "AP Model", "AP IP", "Recovery"])
+        self.vuln_table.setHorizontalHeaderLabels(
+            ["AP Name", "AP Model", "AP IP", "Active Boot Part", "Recovery", "Partition Note"]
+        )
         header_v = self.vuln_table.horizontalHeader()
         header_v.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header_v.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header_v.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header_v.setSectionResizeMode(3, QHeaderView.Stretch)
+        header_v.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header_v.setSectionResizeMode(4, QHeaderView.Stretch)
+        header_v.setSectionResizeMode(5, QHeaderView.Stretch)
         self.vuln_table.setColumnWidth(0, 220)
         self.vuln_table.setColumnWidth(1, 160)
         self.vuln_table.setColumnWidth(2, 160)
-        self.vuln_table.setColumnWidth(3, 500)
+        self.vuln_table.setColumnWidth(3, 130)
+        self.vuln_table.setColumnWidth(4, 350)
+        self.vuln_table.setColumnWidth(5, 350)
         self.vuln_table.setShowGrid(False)
         self.vuln_table.setAlternatingRowColors(True)
         # ── explicitly enable vertical scroll ────────────────
@@ -2149,16 +2302,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "ap_upload_row"):
             self.ap_upload_row.setVisible(is_ap_only)
 
-        # 🔴 CLEAR STATS WHEN NOT AP ONLY
-        if hasattr(self, "ap_stats"):
-            if not is_ap_only:
-                self.ap_stats.clear()
+        if hasattr(self, "ap_stats") and not is_ap_only:
+            self.ap_stats.clear()
 
+        # Always allow the button to be clicked.
+        # Validation is handled in _step1_enter_credentials().
         if hasattr(self, "btn_step1_next"):
-            if is_ap_only:
-                self.btn_step1_next.setEnabled(bool(self.ap_list_file) or bool(self.ap_list_path))
-            else:
-                self.btn_step1_next.setEnabled(True)
+            self.btn_step1_next.setEnabled(True)
     def _browse_ap_list(self):
 
         path, _ = QFileDialog.getOpenFileName(
@@ -2681,10 +2831,12 @@ class MainWindow(QMainWindow):
                 iterations_enabled  = getattr(self, "iterations_enabled",  False),
                 iteration_count     = getattr(self, "iteration_count",     1),
                 iteration_interval  = getattr(self, "iteration_interval",  300),
-            )
+                )
+            
             self.worker.enable_tmp_cleanup = getattr(self, "enable_tmp_cleanup", False)
             self.worker.enable_reload = getattr(self, "enable_reload", False)
             self.worker.enable_debug_collection = getattr(self, "enable_debug_collection", False)
+            self.worker.test_after_iteration = getattr(self, "test_after_iteration", False)
         except Exception as e:
             QMessageBox.critical(self, "Worker Error", f"Failed to create worker: {e}")
             return
@@ -2857,16 +3009,20 @@ class MainWindow(QMainWindow):
                 self.sidebar.setEnabled(True)
 
     def _step2_proceed(self):
+        if self.operation_type!= "AP Only":
+            missing = self._validate_all_wlcs()
 
-        missing = self._validate_all_wlcs()
-
-        if missing:
-            QMessageBox.warning(
-                self,
-                "Missing WLC Credentials",
-                f"Please fill credentials for:\n{', '.join(missing)}"
-            )
-            return  # 🚫 BLOCK navigation
+            if missing:
+                QMessageBox.warning(
+                    self,
+                    "Missing WLC Credentials",
+                    f"Please fill credentials for:\n{', '.join(missing)}"
+                )
+                return  # 🚫 BLOCK navigation
+        if self.operation_type in ("WLC & AP", "AP Only"):
+            if not self.ap_user.text().strip() or not self.ap_pass.text().strip():
+                QMessageBox.warning(self, "Missing AP Credentials", "Please fill AP Username and Password.")
+                return
         self._update_workflow_dropdown()
         
         # ✅ Only move if validation passed
@@ -2916,6 +3072,8 @@ class MainWindow(QMainWindow):
                 "show flash",
                 "show flash | i cnssdaemon.log",
                 "show boot",
+                "show filesystem",
+                "show image integrity"
                 
             ]
             
@@ -2990,7 +3148,12 @@ class MainWindow(QMainWindow):
                 # WLC & AP — still allow site/model filter
                 self._goto_step(4)
             return
-
+        if wf == "AP Datapath Queue Mon":
+            self.ap_cmds = []
+            self.ap_filter_mode = "NONE"
+            self._fill_preview()
+            self._goto_step(5)   # jump straight to Step6 Preview — no Step4, no Step5
+            return
         # Default: Custom CLI Commands -> show Step4
         if self.workflow == "Client Stuck In Auth Loop":
             self._goto_step(5)   # skip Step4 → go to Step5
@@ -3002,7 +3165,11 @@ class MainWindow(QMainWindow):
         """
         Step4 → decide next navigation step.
         """
-
+        if self.workflow == "AP Datapath Queue Mon":
+            self.ap_cmds = []
+            self._fill_preview()
+            self._goto_step(5)
+            return
         # Read WLC commands
         try:
             if hasattr(self, "wlc_cmd_box"):
@@ -3386,8 +3553,10 @@ class MainWindow(QMainWindow):
                     name = self.vuln_table.item(r, 0).text() if self.vuln_table.item(r, 0) else ""
                     model = self.vuln_table.item(r, 1).text() if self.vuln_table.item(r, 1) else ""
                     ip = self.vuln_table.item(r, 2).text() if self.vuln_table.item(r, 2) else ""
-                    recovery = self.vuln_table.item(r, 3).text() if self.vuln_table.item(r, 3) else ""
-                    rows.append([name, model, ip, recovery])
+                    boot_part = self.vuln_table.item(r, 3).text() if self.vuln_table.item(r, 3) else ""
+                    recovery = self.vuln_table.item(r, 4).text() if self.vuln_table.item(r, 4) else ""
+                    part_note = self.vuln_table.item(r, 5).text() if self.vuln_table.item(r, 5) else ""
+                    rows.append([name, model, ip, boot_part, recovery, part_note])
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed reading Vulnerable table: {e}")
                 return
@@ -3406,7 +3575,7 @@ class MainWindow(QMainWindow):
             ws = wb.active
             ws.title = "Susceptible APs"
 
-            headers = ["AP Name", "AP Model", "AP IP", "Recovery"]
+            headers = ["AP Name", "AP Model", "AP IP", "Active Boot Part", "Recovery", "Partition Note"]
             ws.append(headers)
 
             # header styling
@@ -3427,7 +3596,9 @@ class MainWindow(QMainWindow):
             ws.column_dimensions["A"].width = 30
             ws.column_dimensions["B"].width = 18
             ws.column_dimensions["C"].width = 18
-            ws.column_dimensions["D"].width = 90
+            ws.column_dimensions["D"].width = 18
+            ws.column_dimensions["E"].width = 60
+            ws.column_dimensions["F"].width = 60
 
             wb.save(fn)
             QMessageBox.information(self, "Excel Exported", f"Saved: {fn}")
@@ -3460,7 +3631,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Folder Failed", str(e))
     def _on_workflow_change(self, v: str):
         self.workflow = v
-
+        is_datapath_mon = (v == "AP Datapath Queue Mon")
+        if hasattr(self, "datapath_mon_widget"):
+            self.datapath_mon_widget.setVisible(is_datapath_mon)
+        if hasattr(self, "ap_cmd_box"):
+            self.ap_cmd_box.setVisible(not is_datapath_mon)
+        if hasattr(self, "ap_mode_dd"):
+            self.ap_mode_dd.setEnabled(not is_datapath_mon)
+        if hasattr(self, "ftp_group") and is_datapath_mon:
+            self.ftp_group.setVisible(False)
         # Upload config visibility
         if hasattr(self, "upload_config_widget"):
             self.upload_config_widget.setVisible(v == "Upload Files from AP")
@@ -3611,7 +3790,7 @@ class MainWindow(QMainWindow):
         Disable iterations if the current workflow/commands involve
         image download or reload — these are not safe to repeat.
         """
-        incompatible_workflows = {"AP Image Download", "TMP Cleanup + reload"}
+        incompatible_workflows = {"AP Image Download", "TMP Cleanup + reload", "AP Datapath Queue Mon"}
         incompatible_cmd_patterns = (
             "archive download-sw", "sftp://", "scp://", "reload", "%reload%"
         )
@@ -3755,11 +3934,148 @@ class MainWindow(QMainWindow):
                         self.run_log.append(f"[AUTH] Auto-save failed: {_e}")
 
             # ---------------- VULNERABLE TABLE ----------------
+            default_vuln_headers = ["AP Name", "AP Model", "AP IP", "Active Boot Part", "Recovery", "Partition Note"]
             if hasattr(self, "vuln_table"):
                 try:
                     self.vuln_table.setRowCount(0)
+                    if wf != "AP Datapath Queue Mon":
+                        self.vuln_table.setHorizontalHeaderLabels(default_vuln_headers)
                 except Exception:
                     pass
+
+            # ---------------- AP DATAPATH QUEUE MON RESULTS ----------------
+            if (not is_wlc_only) and wf == "AP Datapath Queue Mon":
+                dp_results = summary.get("datapath_results", [])
+
+                if hasattr(self, "run_log"):
+                    try:
+                        self.run_log.append("\n===== AP DATAPATH QUEUE MONITOR SUMMARY =====")
+                        self.run_log.append(f"Total APs checked : {len(dp_results)}")
+                        all_dps = [dp for r in dp_results for dp in r.get("datapaths", [])]
+                        healthy = sum(1 for dp in all_dps if dp.get("overall_assessment") == "Healthy")
+                        stuck = sum(1 for dp in all_dps if dp.get("overall_assessment") == "Possible Datapath Queue Stuck")
+                        no_clients = sum(1 for r in dp_results if not r.get("datapaths"))
+                        self.run_log.append(f"Healthy Datapaths      : {healthy}")
+                        self.run_log.append(f"Possibly Stuck         : {stuck}")
+                        self.run_log.append(f"APs with no clients    : {no_clients}")
+                        self.run_log.append("=" * 50)
+                        for r in dp_results:
+                            self.run_log.append(f"{r.get('ap_name')} ({r.get('ap_ip')}): {r.get('status')}")
+                            for dp in r.get("datapaths", []):
+                                self.run_log.append(
+                                    f"    [{dp.get('datapath_id')}] clients={dp.get('clients')} -> "
+                                    f"{dp.get('overall_assessment', '')}"
+                                )
+                                if dp.get("recommended_recovery"):
+                                    self.run_log.append(f"        Recovery: {dp['recommended_recovery']}")
+                    except Exception:
+                        pass
+
+                if hasattr(self, "results_summary"):
+                    try:
+                        rs_lines = self.results_summary.toPlainText()
+                        rs_lines += (
+                            f"\n\nAP Datapath Queue Mon: {len(dp_results)} AP(s) checked | "
+                            f"Success: {summary.get('ap_success', 0)} | Failed: {summary.get('ap_failed', 0)}"
+                        )
+                        self.results_summary.setPlainText(rs_lines)
+                    except Exception:
+                        pass
+
+                
+                if hasattr(self, "vuln_section"):
+                    try:
+                        self.vuln_section.setVisible(True)
+                    except Exception:
+                        pass
+                if hasattr(self, "ap_section"):
+                    try:
+                        self.ap_section.setVisible(True)
+                    except Exception:
+                        pass
+
+                # ---- Populate Susceptible table: only datapaths flagged stuck ----
+                if hasattr(self, "vuln_table"):
+                    try:
+                        self.vuln_table.setHorizontalHeaderLabels(
+                            ["AP Name", "AP Model", "AP IP", "Datapath", "Recovery", "Clients"]
+                        )
+                        for r in dp_results:
+                            ap_ip = r.get("ap_ip", "")
+                            ap_name = r.get("ap_name", "")
+                            for dp in r.get("datapaths", []):
+                                if dp.get("overall_assessment") != "Possible Datapath Queue Stuck":
+                                    continue
+
+                                real_model = "UNKNOWN"
+                                for ap_r in range(self.ap_table.rowCount()):
+                                    ip_item = self.ap_table.item(ap_r, 2)
+                                    if ip_item and ip_item.text() == ap_ip:
+                                        m_item = self.ap_table.item(ap_r, 1)
+                                        if m_item and m_item.text():
+                                            real_model = m_item.text()
+                                        break
+
+                                row_idx = self.vuln_table.rowCount()
+                                self.vuln_table.insertRow(row_idx)
+                                self.vuln_table.setItem(row_idx, 0, QTableWidgetItem(ap_name))
+                                self.vuln_table.setItem(row_idx, 1, QTableWidgetItem(real_model))
+                                self.vuln_table.setItem(row_idx, 2, QTableWidgetItem(ap_ip))
+                                self.vuln_table.setItem(row_idx, 3, QTableWidgetItem(dp.get("datapath_id", "")))
+                                self.vuln_table.setItem(row_idx, 4, QTableWidgetItem(
+                                    dp.get("recommended_recovery", "")))
+                                self.vuln_table.setItem(row_idx, 5, QTableWidgetItem(
+                                    ",".join(dp.get("clients", []))))
+                    except Exception as e:
+                        if hasattr(self, "run_log"):
+                            try:
+                                self.run_log.append(f"[DEBUG] Failed populating vuln_table (datapath): {e}")
+                            except Exception:
+                                pass
+                # ---- Save a dedicated report file (separate from per-AP logs) ----
+                try:
+                    folder = str(summary.get("data_dir", DATA_DIR))
+                    os.makedirs(folder, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    fn = os.path.join(folder, f"DatapathQueueMon_Summary_{ts}.txt")
+                    with open(fn, "w", encoding="utf-8") as _f:
+                        _f.write("=" * 60 + "\n")
+                        _f.write("AP DATAPATH QUEUE MONITOR — RUN SUMMARY\n")
+                        _f.write("=" * 60 + "\n")
+                        _f.write(f"Run time      : {datetime.now().isoformat()}\n")
+                        _f.write(f"Client MAC    : {getattr(self, 'datapath_client_mac', '')}\n")
+                        _f.write(f"AP list file  : {getattr(self, 'ap_list_file', '')}\n")
+                        _f.write(f"Total APs     : {len(dp_results)}\n")
+                        _f.write(f"Success       : {summary.get('ap_success', 0)}\n")
+                        _f.write(f"Failed        : {summary.get('ap_failed', 0)}\n")
+                        _f.write("-" * 60 + "\n\n")
+                        for r in dp_results:
+                            _f.write(f"AP            : {r.get('ap_name')} ({r.get('ap_ip')})\n")
+                            _f.write(f"Status        : {r.get('status')}\n")
+
+                            dps = r.get("datapaths", [])
+                            if not dps:
+                                _f.write("Datapath ID   : n/a\n")
+                                _f.write("Radio ID      : n/a\n")
+                                _f.write("Assessment    : n/a\n")
+                            else:
+                                for dp in dps:
+                                    _f.write(f"  Datapath ID : {dp.get('datapath_id', 'n/a')}\n")
+                                    _f.write(f"  Radio ID    : {dp.get('radio_id', 'n/a')}\n")
+                                    _f.write(f"  Clients     : {','.join(dp.get('clients', []))}\n")
+                                    _f.write(f"  Assessment  : {dp.get('overall_assessment', '')}\n")
+                                    if dp.get("recommended_recovery"):
+                                        _f.write(f"  Recovery    : {dp.get('recommended_recovery')}\n")
+                                    _f.write("  " + "-" * 20 + "\n")
+
+                            _f.write("-" * 40 + "\n")
+                        _f.write("\nNote: per-AP raw CLI output and per-AP detailed report are in\n")
+                        _f.write("DatapathMon_<model>_<apname>.log files in this same folder.\n")
+                    if hasattr(self, "run_log"):
+                        self.run_log.append(f"\n[DATAPATH] Summary report saved to: {fn}")
+                except Exception as _e:
+                    if hasattr(self, "run_log"):
+                        self.run_log.append(f"[DATAPATH] Failed to save summary report: {_e}")
 
             if (not is_wlc_only) and wf == "AP Flash Checker":
                 if hasattr(self, "run_log"):
@@ -3780,10 +4096,33 @@ class MainWindow(QMainWindow):
                         for vr in vuln_rows:
                             r = self.vuln_table.rowCount()
                             self.vuln_table.insertRow(r)
+                            raw_model = vr.get("ap_model", "")
+                            # Extract [reason] from model if present, move it to recovery
+                            m = re.match(r'^(.*?)(\[.*\])\s*$', raw_model)
+                            if m:
+                                clean_model = m.group(1).strip()
+                                reason = " " + m.group(2)
+                            else:
+                                clean_model = raw_model
+                                reason = ""
                             self.vuln_table.setItem(r, 0, QTableWidgetItem(vr.get("ap_name", "")))
-                            self.vuln_table.setItem(r, 1, QTableWidgetItem(vr.get("ap_model", "")))
+                            # AFTER — look up real model from AP table by IP
+                            real_model = clean_model  # fallback to parser model
+                            ap_ip = vr.get("ap_ip", "")
+                            for ap_r in range(self.ap_table.rowCount()):
+                                ip_col = 2 if self.operation_type == "AP Only" else 3
+                                ip_item = self.ap_table.item(ap_r, ip_col)
+                                if ip_item and ip_item.text() == ap_ip:
+                                    model_col = 1 if self.operation_type == "AP Only" else 2
+                                    m_item = self.ap_table.item(ap_r, model_col)
+                                    if m_item and m_item.text() and m_item.text() != "UNKNOWN":
+                                        real_model = m_item.text()
+                                    break
+                            self.vuln_table.setItem(r, 1, QTableWidgetItem(real_model))
                             self.vuln_table.setItem(r, 2, QTableWidgetItem(vr.get("ap_ip", "")))
-                            self.vuln_table.setItem(r, 3, QTableWidgetItem(vr.get("recovery", "")))
+                            self.vuln_table.setItem(r, 3, QTableWidgetItem(vr.get("active_boot_part", "")))
+                            self.vuln_table.setItem(r, 4, QTableWidgetItem(vr.get("recovery", "") + reason))
+                            self.vuln_table.setItem(r, 5, QTableWidgetItem(vr.get("partition_note", "")))
                     except Exception as e:
                         if hasattr(self, "run_log"):
                             try:
@@ -3792,7 +4131,7 @@ class MainWindow(QMainWindow):
                                 pass
 
             # ---------------- AP TABLE (skip for WLC only) ----------------
-            if not is_wlc_only:
+            if not is_wlc_only and wf != "AP Datapath Queue Mon":
                 try:
                     # So AP Only mode never loads old WLC files.
                     need_populate = (
@@ -3911,16 +4250,17 @@ class MainWindow(QMainWindow):
             # ---------------- FINAL MODEL CORRECTION ----------------
             vuln_rows = summary.get("vulnerable_rows", [])
 
-            for vr in vuln_rows:
-                ip = vr.get("ap_ip")
-                model = vr.get("ap_model")
+            #for vr in vuln_rows:
+             #   ip = vr.get("ap_ip")
+              #  model = vr.get("ap_model")
 
-                for r in range(self.ap_table.rowCount()):
-                    ip_item = self.ap_table.item(r, 2)
-                    if ip_item and ip_item.text() == ip:
-                        if model and model != "UNKNOWN":
-                            self.ap_table.setItem(r, 1, QTableWidgetItem(model))
-                        break
+               # for r in range(self.ap_table.rowCount()):
+                #    ip_item = self.ap_table.item(r, 2)
+                 #   if ip_item and ip_item.text() == ip:
+                  #      if model and model != "UNKNOWN":
+                   #         clean_model = re.sub(r'\[.*\]', '', model).strip()
+                    #        self.ap_table.setItem(r, 1, QTableWidgetItem(clean_model))
+                     #   break
 
 
            
@@ -3936,7 +4276,19 @@ class MainWindow(QMainWindow):
         # finally mark run_in_progress false
         try:
             self.run_count += 1
-            if self.run_count >= 2 and not getattr(self, "headless_mode", False):
+
+            ap_table_empty = (
+                hasattr(self, "ap_table")
+                and self.operation_type != "WLC Only"
+                and self.ap_table.rowCount() == 0
+            )
+            
+            if (
+                self.run_count >= 2
+                and not getattr(self, "headless_mode", False)
+                and not ap_table_empty
+                and summary.get("ap_total", 0) > 0
+            ):
                 QMessageBox.information(
                     self,
                     "Restart Recommended",
@@ -3945,6 +4297,7 @@ class MainWindow(QMainWindow):
                     "Continuing without restart may cause unexpected behaviour."
                 )
             self.run_in_progress = False
+            
 
             # Auto-quit in headless mode after run completes
             if getattr(self, "headless_mode", False) and win.ini.cfg.has_section("CRONJOB"):
@@ -3954,11 +4307,11 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 # Stay on Step7 — user decides via Delete CronJob button whether to keep it
-                try:
-                    if hasattr(self, "sidebar"):
-                        self.sidebar.setEnabled(True)
-                except Exception:
-                    pass
+            try:
+                if hasattr(self, "sidebar"):
+                    self.sidebar.setEnabled(True)
+            except Exception:
+                pass
                         
         except Exception:
             pass
@@ -3986,6 +4339,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.run_log.append(f"[AUTH] Save failed: {e}")
     def _on_ap_update(self, *args):
+        
+
         # ✅ SAFE UNPACKING (handles both 4 and 6 args)
 
         row = None
@@ -4366,13 +4721,14 @@ class MainWindow(QMainWindow):
             self.ap_upload_box.setVisible(self.operation_type == "AP Only")
 
         if hasattr(self, "btn_step1_next"):
+            self.btn_step1_next.setEnabled(True)
+
             if self.operation_type == "AP Only":
-                self.btn_step1_next.setEnabled(
-                    bool(getattr(self, "ap_list_file", "")) or
-                    bool(getattr(self, "ap_list_path", ""))
+                self.btn_step1_next.setToolTip(
+                    "Please upload an AP list file before proceeding."
                 )
             else:
-                self.btn_step1_next.setEnabled(True)
+                self.btn_step1_next.setToolTip("")
 
         # ---------------- STEP 2 (FIXED) ----------------
         show_wlc = self.operation_type in ("WLC Only", "WLC & AP")
@@ -4613,6 +4969,7 @@ class MainWindow(QMainWindow):
                 "AP Flash Checker",
                 "Custom CLI Commands",
                 "TMP Cleanup + reload",
+                "AP Datapath Queue Mon",     
             ])
 
         # ✅ AP ONLY
@@ -4621,7 +4978,8 @@ class MainWindow(QMainWindow):
                 "AP Flash Checker",
                 "Custom CLI Commands",
                 "Upload Files from AP",
-                "TMP Cleanup + reload"
+                "TMP Cleanup + reload",
+                "AP Datapath Queue Mon",
                 
             ])
 

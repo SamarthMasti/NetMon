@@ -76,7 +76,8 @@ QCA_PREFIXES = (
     "9178",
     "9179",
 )
-
+DATAPATH_MON_DEFAULT_ITERATIONS = 5
+DATAPATH_MON_DEFAULT_INTERVAL_SEC = 20
 def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
@@ -1183,7 +1184,11 @@ class PollerEngine:
                 os.makedirs(wlc_folder, exist_ok=True)
             else:
                 wlc_folder = self.data_dir
-            fname = os.path.join(wlc_folder, f"{device}_{_safe_filename(ap.name)}.log")
+
+            # Use actual_model for filename — resolved from show inventory above
+            safe_model = _safe_filename(actual_model) if actual_model and actual_model != "UNKNOWN" else device
+            fname = os.path.join(wlc_folder, f"{safe_model}_{_safe_filename(ap.name)}.log")
+
             header = (
                 f"<run timestamp='{datetime.now().isoformat()}' device='{device}' hostname='{ap.name}' "
                 f"model='{ap.model}' version='{img}' Ip='{ap.ip}' SN='{sn}'>\n"
@@ -1251,32 +1256,53 @@ class PollerEngine:
                 # ================================
                 # 🔥 RELOAD (ONLY IF CLEANED)
                 # ================================
-                if "reload" in cmd_lower:
+                # ================================
+                # 🔥 RELOAD
+                # ================================
+                if needs_confirm:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     if True:
                         self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd}")
                         _safe_write_append(fname, f"\n<cmd string='{actual_cmd}'>\n\t{actual_cmd}\n")
-                        self._log(f"[TMP] {ap.ip} → Injecting reload (cleanup was done)")
+                        self._log(f"[TMP] {ap.ip} → Sending reload command")
+
                         try:
-                            out = conn.send_command_timing(actual_cmd)
-                            if "confirm" in out.lower():
-                                conn.send_command_timing("\n")
-                            self._log(f"[TMP] {ap.ip} → Reload initiated successfully")
-                            _safe_write_append(fname, "[TMP] Reload initiated\n")
-                        
+                            # Send reload
+                            conn.write_channel(actual_cmd + "\n")
+                            time.sleep(2)
+                            out = conn.read_channel()
+
+                            # Save raw to file always
+                            _safe_write_append(fname, out)
+
+                            # Send 'y' for any confirmation prompt
+                            if "confirm" in out.lower() or "[yes/no]" in out.lower() or "proceed" in out.lower():
+                                self._log(f"[RELOAD] {ap.ip} → Confirmation prompt detected, sending 'y'")
+                                conn.write_channel("y\n")
+                                time.sleep(2)
+                                out2 = conn.read_channel()
+                                _safe_write_append(fname, out2)
+
+
+
                         except Exception:
                             self._log(f"[TMP] {ap.ip} → Connection closed after reload (expected)")
                             _safe_write_append(fname, "[TMP] Connection closed after reload (expected)\n")
+
                     else:
-                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd} [SKIPPED — no cleanup was needed]")
-                        _safe_write_append(fname, f"\n[TMP] Reload skipped (cleanup was not needed)\n")
-                    break
+                        self._log(f"{timestamp} | {ap.ip:<15} | {ap.name:<15} | {actual_cmd} [SKIPPED]")
+                        _safe_write_append(fname, f"\n[TMP] Reload skipped\n")
+                    if cmd_lower == "reload":
+                        break        # AP reboots — nothing else to run
+                    continue         # any other %cmd% — proceed to next command
 
                 # ================================
                 # 🔥 TRANSFER COMMANDS (upload/copy)
                 # ================================
                 is_transfer_cmd = (
+                    
                     "sftp://" in cmd_lower
+                    or "tftp://" in cmd_lower
                     or "scp://" in cmd_lower
                     or "copy syslogs" in cmd_lower
                     or "copy core:" in cmd_lower
@@ -1543,7 +1569,408 @@ class PollerEngine:
         def _sort_key(s):
             return 0 if s == "WLC" else int(s[3:])
         return sorted(sections, key=lambda s: 0 if s == "WLC" else int(s[3:]))
+    # ==================================================================
+    # AP DATAPATH QUEUE MONITOR  (new, self-contained AP-Only workflow)
+    # Does not touch _poll_one_ap / run_ap_poller / any other workflow.
+    # ==================================================================
 
+    def run_ap_datapath_queue_monitor(self, ap_rows: List[ApRow],
+                                       iterations: int = None, interval: int = None):
+        """
+        Entry point for the 'AP Datapath Queue Mon' workflow.
+        No client MAC required — runs against every client/Radio/VAP currently
+        active on each AP.
+        """
+        iterations = iterations or DATAPATH_MON_DEFAULT_ITERATIONS
+        interval = interval or DATAPATH_MON_DEFAULT_INTERVAL_SEC
+
+        self._log(f"[DATAPATH] Starting AP Datapath Queue Monitor (all clients) | "
+                   f"Iterations={iterations} Interval={interval}s")
+
+        results_summary = []
+        total = len(ap_rows)
+        self.success = 0
+        self.failed = 0
+
+        for idx, ap in enumerate(ap_rows):
+            if self._shutdown_event.is_set():
+                break
+            self._log(f"[DATAPATH] ({idx+1}/{total}) Connecting {ap.ip} ({ap.name}) ...")
+
+            ap_result = {
+                "ap_ip": ap.ip, "ap_name": ap.name,
+                "status": "Failed", "datapaths": []
+            }
+            conn = None
+            try:
+                params = self._ap_connect_params(ap.ip, ap.model)
+                for _ in range(3):
+                    try:
+                        conn = ConnectHandler(**params)
+                        break
+                    except Exception:
+                        time.sleep(3)
+                if conn is None:
+                    raise RuntimeError("Connection retries exhausted")
+
+                self._open_sessions.append(conn)
+                conn.enable()
+                try:
+                    self._ap_send_command(conn, "terminal length 0", read_timeout=30)
+                except Exception:
+                    pass
+
+                # ---- Discover ALL active client datapaths on this AP ----
+                datapaths = self._discover_all_client_datapaths(conn)
+
+                if not datapaths:
+                    self._log(f"[DATAPATH] {ap.ip}: No active wireless clients found. "
+                               f"No datapaths discovered. Skipping datapath queue analysis.")
+                    ap_result["status"] = (
+                        "No active wireless clients found. "
+                        "No datapaths discovered. Skipping datapath queue analysis."
+                    )
+                    self.success += 1
+                    conn.disconnect()
+                    results_summary.append(ap_result)
+                    if self.ap_update_cb:
+                        try:
+                            self.ap_update_cb(idx, ap.ip, ap.model, ap_result["status"], ap.name, getattr(ap, "wlc_ip", ""))
+                        except Exception:
+                            pass
+                    self._progress(int(((idx + 1) / total) * 100) if total else 100)
+                    continue
+
+                self._log(f"[DATAPATH] {ap.ip}: Discovered {len(datapaths)} datapath(s): "
+                           f"{list(datapaths.keys())}")
+
+                ap_folder = os.path.join(self.data_dir, "DatapathMonitor", _safe_filename(ap.name))
+                os.makedirs(ap_folder, exist_ok=True)
+
+                # ---- Loop over every discovered datapath (Radio/VAP) ----
+                for datapath_id, dp_info in datapaths.items():
+                    if self._shutdown_event.is_set():
+                        break
+                    radio_id = dp_info.get("radio_id")
+                    clients = dp_info.get("clients", [])
+
+                    dp_folder = os.path.join(ap_folder, _safe_filename(datapath_id))
+                    os.makedirs(dp_folder, exist_ok=True)
+                    fname = os.path.join(dp_folder, "iterations.log")
+                    header = (
+                        f"<run timestamp='{datetime.now().isoformat()}' device='AP-DATAPATH-MON' "
+                        f"hostname='{ap.name}' Ip='{ap.ip}' clients='{','.join(clients)}' "
+                        f"datapath='{datapath_id}'>\n"
+                    )
+                    _safe_write_append(fname, header)
+
+                    dp_iterations = []
+
+                    for it in range(1, iterations + 1):
+                        if self._shutdown_event.is_set():
+                            break
+                        self._log(f"[DATAPATH] {ap.ip} [{datapath_id}]: Iteration {it}/{iterations}")
+                        raw = self._collect_datapath_counters(conn, datapath_id)
+
+                        # Stream raw output to Run Log
+                        self._log(f"===== {datapath_id} — ITERATION {it} =====")
+                        self._log(raw.get("drops_raw", ""))
+                        self._log(raw.get("queue_raw", ""))
+                        self._log(raw.get("calls_raw", ""))
+
+                        _safe_write_append(fname, f"\n===== ITERATION {it} =====\n")
+                        _safe_write_append(fname, raw.get("drops_raw", "") + "\n")
+                        _safe_write_append(fname, raw.get("queue_raw", "") + "\n")
+                        _safe_write_append(fname, raw.get("calls_raw", "") + "\n")
+
+                        dp_iterations.append({
+                            "iteration": it,
+                            "drops": self._parse_drop_output(raw.get("drops_raw", "")),
+                            "queue": self._parse_queue_output(raw.get("queue_raw", "")),
+                            "calls": self._parse_calls_output(raw.get("calls_raw", "")),
+                        })
+
+                        if it < iterations:
+                            elapsed = 0
+                            while elapsed < interval:
+                                if self._shutdown_event.is_set():
+                                    break
+                                chunk = min(10, interval - elapsed)
+                                time.sleep(chunk)
+                                elapsed += chunk
+
+                    analysis = self._analyze_datapath_results(radio_id, dp_iterations)
+
+                    # ---- Delay before writing report.txt ----
+                    # Gives a visible pause between the last raw iteration and the
+                    # generated report — also naturally delays the run's completion,
+                    # which delays the GUI's summary file write in _on_finished.
+                    self._log(f"[DATAPATH] {ap.ip} [{datapath_id}]: Analyzing... "
+                               f"generating report in 15s")
+                    time.sleep(15)  # adjust seconds as needed for testing
+
+                    report_file = os.path.join(dp_folder, "report.txt")
+                    self._generate_datapath_report(report_file, ap.name, ap.ip,
+                                                    ",".join(clients), datapath_id,
+                                                    dp_iterations, analysis)
+
+                    ap_result["datapaths"].append({
+                        "datapath_id": datapath_id,
+                        "radio_id": radio_id,
+                        "clients": clients,
+                        "iterations": dp_iterations,
+                        **analysis,
+                    })
+
+                conn.disconnect()
+                ap_result["status"] = "Success"
+                self.success += 1
+
+                if self.ap_update_cb:
+                    try:
+                        stuck_count = sum(
+                            1 for dp in ap_result["datapaths"]
+                            if dp.get("overall_assessment") == "Possible Datapath Queue Stuck"
+                        )
+                        status_msg = (
+                            f"Success: {len(ap_result['datapaths'])} datapath(s) checked, "
+                            f"{stuck_count} possibly stuck"
+                        )
+                        self.ap_update_cb(idx, ap.ip, ap.model, status_msg, ap.name, getattr(ap, "wlc_ip", ""))
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                self._log(f"[DATAPATH] {ap.ip}: ERROR - {e}")
+                ap_result["status"] = f"Failed: {e}"
+                self.failed += 1
+                if self.ap_update_cb:
+                    try:
+                        self.ap_update_cb(idx, ap.ip, ap.model, ap_result["status"], ap.name, getattr(ap, "wlc_ip", ""))
+                    except Exception:
+                        pass
+                try:
+                    if conn is not None:
+                        conn.disconnect()
+                except Exception:
+                    pass
+
+            results_summary.append(ap_result)
+            self._progress(int(((idx + 1) / total) * 100) if total else 100)
+
+        self._log(f"[DATAPATH] Done. Success={self.success} Failed={self.failed}")
+        return results_summary
+
+    def _discover_all_client_datapaths(self, conn):
+        """
+        Runs 'show client summary' and returns every unique datapath (Radio+VAP)
+        currently in use on the AP, mapped to the client MACs using it:
+        { "apr0v0": {"radio_id": "0", "clients": ["aa:bb:cc:dd:ee:ff", ...]}, ... }
+        """
+        try:
+            out = self._ap_send_command(conn, "show client summary", read_timeout=120)
+        except Exception as e:
+            self._log(f"[DATAPATH] show client summary failed: {e}")
+            return {}
+        return self._parse_all_datapaths(out)
+
+    def _parse_all_datapaths(self, output: str):
+        datapaths = {}
+        lines = output.splitlines()
+
+        # ---- Priority 1: Datapath IPv4 client Summary ----
+        in_section = False
+        for line in lines:
+            if "Datapath IPv4 client Summary" in line:
+                in_section = True
+                continue
+            if in_section:
+                if line.strip().endswith("Summary") and "Datapath" not in line:
+                    in_section = False
+                    continue
+                m_mac = re.search(r"([0-9a-fA-F]{2}[:.\-]){5}[0-9a-fA-F]{2}", line)
+                m_dp = re.search(r"(apr\d+v\d+)", line, re.IGNORECASE)
+                if m_mac and m_dp:
+                    dp = m_dp.group(1).lower()
+                    mac = m_mac.group(0).lower()
+                    rm = re.search(r"apr(\d+)v(\d+)", dp)
+                    radio = rm.group(1) if rm else None
+                    entry = datapaths.setdefault(dp, {"radio_id": radio, "clients": []})
+                    if mac not in entry["clients"]:
+                        entry["clients"].append(mac)
+
+        if datapaths:
+            return datapaths
+
+        # ---- Priority 2: WCP client Summary ----
+        in_section = False
+        for line in lines:
+            if "WCP client Summary" in line:
+                in_section = True
+                continue
+            if in_section:
+                if not line.strip():
+                    continue
+                if line.strip().endswith("Summary") and "WCP" not in line:
+                    in_section = False
+                    continue
+                if line.strip().upper().startswith("MAC"):
+                    continue
+                if set(line.strip()) <= set("-"):
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+
+                mac, radio, vap = parts[0].lower(), parts[1], parts[2]
+
+                # Only accept real client rows: MAC must look like a MAC,
+                # radio/vap must be numbers. This stops header/section-title
+                # lines from being mistaken for client data.
+                if not re.match(r"^([0-9a-f]{2}[:.\-]){5}[0-9a-f]{2}$", mac):
+                    in_section = False
+                    continue
+                if not (radio.isdigit() and vap.isdigit()):
+                    continue
+
+                dp = f"apr{radio}v{vap}"
+                entry = datapaths.setdefault(dp, {"radio_id": radio, "clients": []})
+                if mac not in entry["clients"]:
+                    entry["clients"].append(mac)
+
+        return datapaths
+    
+
+    def _collect_datapath_counters(self, conn, datapath_id: str) -> Dict[str, str]:
+        """Runs the 3 datapath commands. Never raises — captures per-command
+        errors so one failing command doesn't abort the remaining ones."""
+        result = {"drops_raw": "", "queue_raw": "", "calls_raw": ""}
+        cmds = {
+            "drops_raw": f"show datapath command /click/{datapath_id}_q/priority_q/drops",
+            "queue_raw": f"show datapath command /click/{datapath_id}_q/priority_q/queued_count",
+            "calls_raw": f"show datapath command /click/todev_{datapath_id}/calls",
+        }
+        for key, cmd in cmds.items():
+            try:
+                result[key] = self._ap_send_command(conn, cmd, read_timeout=60)
+            except Exception as e:
+                result[key] = f"[ERROR] {cmd} failed: {e}"
+                self._log(f"[DATAPATH] Command failed ({cmd}): {e}")
+        return result
+
+    def _parse_drop_output(self, text: str) -> Dict[str, Optional[int]]:
+        out = {"Tot": None, "CTL": None, "VO": None, "VI": None, "BE": None}
+        m = re.search(r"Drops\s*-\s*Tot:(\d+)\s+CTL:(\d+)\s+VO:(\d+)\s+VI:(\d+)\s+BE:(\d+)", text)
+        if m:
+            out["Tot"], out["CTL"], out["VO"], out["VI"], out["BE"] = [int(x) for x in m.groups()]
+        return out
+
+    def _parse_queue_output(self, text: str) -> Dict[str, Optional[int]]:
+        out = {"Tot": None, "CTL": None, "VO": None, "VI": None, "BE": None}
+        m = re.search(r"Queued\s*-\s*Tot:(\d+)\s+CTL:(\d+)\s+VO:(\d+)\s+VI:(\d+)\s+BE:(\d+)", text)
+        if m:
+            out["Tot"], out["CTL"], out["VO"], out["VI"], out["BE"] = [int(x) for x in m.groups()]
+        return out
+
+    def _parse_calls_output(self, text: str) -> Dict[str, Optional[int]]:
+        out = {"packets_sent": None, "hard_start_xmit": None}
+        m = re.search(r"(\d+)\s+packets sent", text)
+        if m:
+            out["packets_sent"] = int(m.group(1))
+        m2 = re.search(r"(\d+)\s+hard start xmit", text)
+        if m2:
+            out["hard_start_xmit"] = int(m2.group(1))
+        return out
+
+    def _analyze_datapath_results(self, radio_id, iterations_data: List[Dict]):
+        if not iterations_data:
+            return {"overall_assessment": "Unknown (no data collected)", "recommended_recovery": ""}
+
+        first, last = iterations_data[0], iterations_data[-1]
+
+        def _fl(metric, field):
+            return first[metric].get(field), last[metric].get(field)
+
+        drops_increased = False
+        for q in ("Tot", "CTL", "VO", "VI", "BE"):
+            f, l = _fl("drops", q)
+            if f is not None and l is not None and l > f:
+                drops_increased = True
+
+        stuck_queues = []
+        for q in ("CTL", "VO", "VI", "BE"):
+            df, dl = _fl("drops", q)
+            qf, ql = _fl("queue", q)
+            if df is not None and dl is not None and dl > df and qf is not None and ql is not None and ql == qf:
+                stuck_queues.append(q)
+
+        ps_f, ps_l = _fl("calls", "packets_sent")
+        hs_f, hs_l = _fl("calls", "hard_start_xmit")
+        packets_sent_stuck = ps_f is not None and ps_l is not None and ps_l == ps_f
+        hard_start_stuck = hs_f is not None and hs_l is not None and hs_l == hs_f
+
+        suspicious = bool(stuck_queues) or (drops_increased and (packets_sent_stuck or hard_start_stuck))
+
+        return {
+            "drops_increased": drops_increased,
+            "stuck_queues": stuck_queues,
+            "packets_sent_stuck": packets_sent_stuck,
+            "hard_start_xmit_stuck": hard_start_stuck,
+            "overall_assessment": "Possible Datapath Queue Stuck" if suspicious else "Healthy",
+            "recommended_recovery": f"test crash radiofw {radio_id or 'X'} 1 1" if suspicious else "",
+        }
+
+    def _generate_datapath_report(self, fname, ap_name, ap_ip, client_mac,
+                                   datapath_id, iterations_data, analysis: Dict):
+        def _with_deltas(values):
+            lines = []
+            prev = None
+            for it, val in values:
+                if val is None:
+                    lines.append(f"  Iteration {it}: N/A")
+                elif prev is None:
+                    lines.append(f"  Iteration {it}: {val}")
+                else:
+                    delta = val - prev
+                    sign = "+" if delta >= 0 else ""
+                    lines.append(f"  Iteration {it}: {val} ({sign}{delta})")
+                if val is not None:
+                    prev = val
+            return lines
+
+        L = []
+        L.append("=" * 50)
+        L.append("AP DATAPATH QUEUE MONITOR REPORT")
+        L.append("=" * 50)
+        L.append(f"AP               : {ap_name} ({ap_ip})")
+        L.append(f"Client MAC       : {client_mac}")
+        L.append(f"Datapath         : {datapath_id}")
+        L.append(f"Iterations       : {len(iterations_data)}")
+        L.append("-" * 50)
+        L.append("Drops (Tot)")
+        L.extend(_with_deltas([(it['iteration'], it['drops'].get('Tot')) for it in iterations_data]))
+        L.append(f"  Status: {'Increasing' if analysis.get('drops_increased') else 'Stable'}")
+        L.append("-" * 50)
+        L.append("Queue (Tot)")
+        L.extend(_with_deltas([(it['iteration'], it['queue'].get('Tot')) for it in iterations_data]))
+        sq = analysis.get("stuck_queues", [])
+        L.append(f"  Status: {'Stuck (' + ','.join(sq) + ')' if sq else 'Increasing'}")
+        L.append("-" * 50)
+        L.append("Packets Sent")
+        L.extend(_with_deltas([(it['iteration'], it['calls'].get('packets_sent')) for it in iterations_data]))
+        L.append(f"  Status: {'Stuck' if analysis.get('packets_sent_stuck') else 'Increasing'}")
+        L.append("-" * 50)
+        L.append("Hard Start Xmit")
+        L.extend(_with_deltas([(it['iteration'], it['calls'].get('hard_start_xmit')) for it in iterations_data]))
+        L.append(f"  Status: {'Stuck' if analysis.get('hard_start_xmit_stuck') else 'Increasing'}")
+        L.append("-" * 50)
+        L.append("Assessment")
+        L.append(f"  {analysis.get('overall_assessment', 'Unknown').upper()}")
+        if analysis.get("recommended_recovery"):
+            L.append("-" * 50)
+            L.append(f"Recommended Recovery: {analysis.get('recommended_recovery')}")
+        L.append("=" * 50)
+        _safe_write_append(fname, "\n" + "\n".join(L) + "\n")
 
 
 
