@@ -1636,7 +1636,21 @@ class PollerEngine:
                     raise RuntimeError("Connection retries exhausted")
 
                 self._open_sessions.append(conn)
-                conn.enable()
+                try:
+                    conn.enable()
+                except Exception as _enable_exc:
+                    if "failed to enter enable mode" in str(_enable_exc).lower():
+                        with self._enable_fail_lock:
+                            self.enable_failed_aps.append({
+                                "name": ap.name,
+                                "model": ap.model,
+                                "ip": ap.ip,
+                            })
+                        self._log(
+                            f"[DATAPATH] {ap.ip} ({ap.name}) — enable mode failed, "
+                            f"flagged for Susceptible Table"
+                        )
+                    raise
                 try:
                     self._ap_send_command(conn, "terminal length 0", read_timeout=30)
                 except Exception:

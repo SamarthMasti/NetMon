@@ -526,6 +526,18 @@ class PollerWorker(QThread):
                         self.log.emit(f"  Success     : {engine.success}")
                         self.log.emit(f"  Failed      : {engine.failed}")
                         self.log.emit("=" * 56)
+                        # ---- NEW: Status Run Check file when APs failed enable mode ----
+                        enable_failed = getattr(engine, "enable_failed_aps", [])
+                        if enable_failed and analyze_logs:
+                            vuln_rows, _ = analyze_logs(
+                                str(summary["data_dir"]),
+                                enable_failed_aps=enable_failed
+                            )
+                            summary["vulnerable_rows"] = vuln_rows
+                            self.log.emit(
+                                f"[DATAPATH] {len(vuln_rows)} AP(s) flagged for enable-mode failure status check."
+                            )
+
                         summary["end"] = datetime.now()
                         self.finished_ok.emit(summary)
                         return
@@ -559,9 +571,10 @@ class PollerWorker(QThread):
 
                     # THEN vulnerability analysis
                     if (
-                        self.workflow == "AP Flash Checker"
-                        and analyze_logs
-                        and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))):
+                        analyze_logs
+                        and not (getattr(self, "enable_tmp_cleanup", False) or getattr(self, "enable_reload", False))
+                        and (self.workflow == "AP Flash Checker" or getattr(engine, "enable_failed_aps", []))
+                    ):
                         self.log.emit("")
                         self.log.emit("=" * 56)
                         if getattr(self, "test_after_iteration", False):
@@ -790,6 +803,17 @@ class PollerWorker(QThread):
                         self.log.emit("=" * 56)
                         total_success = engine.success
                         total_failed = engine.failed
+                        # ---- NEW: Status Run Check file when APs failed enable mode ----
+                        enable_failed = getattr(engine, "enable_failed_aps", [])
+                        if enable_failed and analyze_logs:
+                            vuln_rows, _ = analyze_logs(
+                                str(engine.data_dir),
+                                enable_failed_aps=enable_failed
+                            )
+                            summary["vulnerable_rows"] = vuln_rows
+                            self.log.emit(
+                                f"[DATAPATH] {len(vuln_rows)} AP(s) flagged for enable-mode failure status check."
+                            )
                     # ---- Flash checker analysis (also runs for any workflow when enable-mode failures occurred) ----
                     elif (analyze_logs and
                             not (getattr(self, "enable_tmp_cleanup", False) or
