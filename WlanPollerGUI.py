@@ -584,7 +584,10 @@ class PollerWorker(QThread):
                         self.log.emit("  Please wait — scanning AP output logs.")
                         self.log.emit("=" * 56)
                         self.progress.emit(0)
-                        vuln_rows, _ = analyze_logs(str(summary["data_dir"]))
+                        vuln_rows, _ = analyze_logs(
+                            str(summary["data_dir"]),
+                            enable_failed_aps=getattr(engine, "enable_failed_aps", [])
+                        )
                         self.log.emit(f"[FLASH DEBUG] Parser input folder = {summary['data_dir']}")
 
                         try:
@@ -592,10 +595,43 @@ class PollerWorker(QThread):
                                 self.log.emit(f"[FLASH DEBUG] Found file = {f}")
                         except Exception as e:
                             self.log.emit(f"[FLASH DEBUG] Directory read failed: {e}")
+
                         summary["vulnerable_rows"] = vuln_rows
                         self.log.emit(f"  Susceptibility scan complete. Found: {len(vuln_rows)} Susceptible AP(s)")
                         self.log.emit("=" * 56)
                         self.progress.emit(100)
+
+                    # ---- NEW: fold in enable-mode-failed APs regardless of workflow ----
+                    enable_failed = getattr(engine, "enable_failed_aps", [])
+                    if enable_failed:
+                        vuln_rows_existing = summary.get("vulnerable_rows", [])
+                        existing_ips = {vr.get("ap_ip") for vr in vuln_rows_existing}
+                        ENABLE_FAIL_MSG = (
+                            "Failed to enter enable mode. This may be caused by high "
+                            "storage utilization on the active boot partition or a "
+                            "missing 'secret' parameter. Please ensure the 'secret' "
+                            "parameter is provided and retry."
+                        )
+                        added = 0
+                        for ap_fail in enable_failed:
+                            if ap_fail.get("ip") in existing_ips:
+                                continue
+                            vuln_rows_existing.append({
+                                "ap_name": ap_fail.get("name", ""),
+                                "ap_model": ap_fail.get("model", "") or "UNKNOWN",
+                                "ap_ip": ap_fail.get("ip", ""),
+                                "recovery": ENABLE_FAIL_MSG,
+                                "active_boot_part": "Unknown",
+                                "partition_note": "Enable mode failed — flash status could not be verified.",
+                            })
+                            added += 1
+                        summary["vulnerable_rows"] = vuln_rows_existing
+                        if added:
+                            self.log.emit(
+                                f"[FLASH DEBUG] Added {added} AP(s) with 'Failed to enter "
+                                f"enable mode' to Susceptible Table."
+                            )
+
                     summary["end"] = datetime.now()
                     self.finished_ok.emit(summary)
                     
@@ -754,10 +790,11 @@ class PollerWorker(QThread):
                         self.log.emit("=" * 56)
                         total_success = engine.success
                         total_failed = engine.failed
-                    # ---- Flash checker analysis ----
-                    elif (self.workflow == "AP Flash Checker" and analyze_logs and
+                    # ---- Flash checker analysis (also runs for any workflow when enable-mode failures occurred) ----
+                    elif (analyze_logs and
                             not (getattr(self, "enable_tmp_cleanup", False) or
-                                getattr(self, "enable_reload", False))):
+                                getattr(self, "enable_reload", False)) and
+                            (self.workflow == "AP Flash Checker" or getattr(engine, "enable_failed_aps", []))):
                         self.log.emit("=" * 56)
                         if getattr(self, "test_after_iteration", False):
                             try:
@@ -777,12 +814,47 @@ class PollerWorker(QThread):
                                 self.log.emit(f"[TEST MODE] deletetest copy failed: {_e}")
                         self.log.emit(" RUNNING FLASH SUSCEPTIBILITY ANALYSIS...")
                         self.progress.emit(0)
-                        vuln_rows, _ = analyze_logs(str(engine.data_dir))
+                        vuln_rows, _ = analyze_logs(
+                            str(engine.data_dir),
+                            enable_failed_aps=getattr(engine, "enable_failed_aps", [])
+                        )
+
                         summary["vulnerable_rows"] = vuln_rows
                         self.log.emit(
                             f"  Scan complete. Found: {len(vuln_rows)} susceptible AP(s)"
                         )
                         self.progress.emit(100)
+
+                    # ---- NEW: fold in enable-mode-failed APs regardless of workflow ----
+                    enable_failed = getattr(engine, "enable_failed_aps", [])
+                    if enable_failed:
+                        vuln_rows_existing = summary.get("vulnerable_rows", [])
+                        existing_ips = {vr.get("ap_ip") for vr in vuln_rows_existing}
+                        ENABLE_FAIL_MSG = (
+                            "Failed to enter enable mode. This may be caused by high "
+                            "storage utilization on the active boot partition or a "
+                            "missing 'secret' parameter. Please ensure the 'secret' "
+                            "parameter is provided and retry."
+                        )
+                        added = 0
+                        for ap_fail in enable_failed:
+                            if ap_fail.get("ip") in existing_ips:
+                                continue
+                            vuln_rows_existing.append({
+                                "ap_name": ap_fail.get("name", ""),
+                                "ap_model": ap_fail.get("model", "") or "UNKNOWN",
+                                "ap_ip": ap_fail.get("ip", ""),
+                                "recovery": ENABLE_FAIL_MSG,
+                                "active_boot_part": "Unknown",
+                                "partition_note": "Enable mode failed — flash status could not be verified.",
+                            })
+                            added += 1
+                        summary["vulnerable_rows"] = vuln_rows_existing
+                        if added:
+                            self.log.emit(
+                                f"[FLASH DEBUG] Added {added} AP(s) with 'Failed to enter "
+                                f"enable mode' to Susceptible Table."
+                            )
 
                     summary.update({
                         "ap_total": len(all_filtered),
@@ -4077,7 +4149,7 @@ class MainWindow(QMainWindow):
                     if hasattr(self, "run_log"):
                         self.run_log.append(f"[DATAPATH] Failed to save summary report: {_e}")
 
-            if (not is_wlc_only) and wf == "AP Flash Checker":
+            if (not is_wlc_only) and (wf == "AP Flash Checker" or summary.get("vulnerable_rows")):
                 if hasattr(self, "run_log"):
                     try:
                         self.run_log.append("\n===== PARSER / FLASH CHECK SUMMARY =====")
@@ -4091,6 +4163,11 @@ class MainWindow(QMainWindow):
 
                 if hasattr(self, "run_log"):
                     self.run_log.append(f"Total Susceptible APs Detected: {vuln_count}")
+                    for vr in vuln_rows:
+                        self.run_log.append(
+                            f"  - {vr.get('ap_name', '')} ({vr.get('ap_ip', '')}) -> "
+                            f"{vr.get('recovery', '')}"
+                        )
                 if hasattr(self, "vuln_table"):
                     try:
                         for vr in vuln_rows:
@@ -4129,7 +4206,7 @@ class MainWindow(QMainWindow):
                                 self.run_log.append(f"[DEBUG] Failed populating vuln_table: {e}")
                             except Exception:
                                 pass
-
+                
             # ---------------- AP TABLE (skip for WLC only) ----------------
             if not is_wlc_only and wf != "AP Datapath Queue Mon":
                 try:

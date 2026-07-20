@@ -239,13 +239,19 @@ def part1_mem_available_mb(path: str) -> Tuple[Optional[float], Optional[bool]]:
         return mb, mb < 80.0
 
     return None, None
-def analyze_logs(log_dir: str):
-
+def analyze_logs(log_dir: str, enable_failed_aps: Optional[List[Dict]] = None):
+    enable_failed_aps = enable_failed_aps or []
+    ENABLE_FAIL_MSG = (
+        "Failed to enter enable mode. This may be caused by high storage "
+        "utilization on the active boot partition or a missing 'secret' "
+        "parameter. Please ensure the 'secret' parameter is provided and retry."
+    )
     recovery_option_image_partition_swap = []
     recovery_option_devshell = []
     recovery_option_simple_archive_download = []
     recovery_option_image_integrity_check_failed = []
     recovery_option_partition_safe_but_clean_up_reccomended = []
+    recovery_option_enable_mode_failed = []
     # NEW: per-AP partition info, keyed by "ap_name|ap_ip", so we can attach
     # Active Boot Part + free-space-on-both-partitions data to each row later
     # without touching the many existing recovery_option_*.append(...) tuples.
@@ -439,6 +445,35 @@ def analyze_logs(log_dir: str):
                 recovery_option_devshell.append(
                     (ap_name, f"{ap_model_sig} [MULTI: {failure_desc}]", ap_ip)
                 )
+    # ---- Fold in APs that never produced a log file (enable-mode failure) ----
+    for ap in enable_failed_aps:
+        ap_name = ap.get("name") or "UNKNOWN"
+        ap_model_sig = ap.get("model") or "UNKNOWN"
+        ap_ip = ap.get("ip") or ""
+
+        status_rows.append({
+            "AP Name": ap_name,
+            "Model": ap_model_sig,
+            "Primary Image": "",
+            "Primary Buggy": "",
+            "Backup Image": "",
+            "Backup Buggy": "",
+            "Boot Partition": "Unknown",
+            "Image Integrity Failed": "",
+            "Part1 Free MB": "",
+            "Part2 Free MB": "",
+            "Low Memory": ""
+        })
+
+        ap_partition_info[f"{ap_name}|{ap_ip}"] = {
+            "active_boot_part": "Unknown",
+            "part1_free_mb": None,
+            "part2_free_mb": None,
+            "special_note": ENABLE_FAIL_MSG,
+        }
+
+        recovery_option_enable_mode_failed.append((ap_name, ap_model_sig, ap_ip))
+
     # ---------------------------------------------------
     # Write Status Check Summary File
     # ---------------------------------------------------
@@ -450,7 +485,8 @@ def analyze_logs(log_dir: str):
         recovery_option_devshell,
         recovery_option_simple_archive_download,
         recovery_option_image_integrity_check_failed,
-        recovery_option_partition_safe_but_clean_up_reccomended
+        recovery_option_partition_safe_but_clean_up_reccomended,
+         recovery_option_enable_mode_failed,
     ])
 
     output_file = ""
@@ -520,6 +556,7 @@ def analyze_logs(log_dir: str):
             write_recovery("Safe state but buggy backup image", recovery_option_simple_archive_download)
             write_recovery("Image integrity failed", recovery_option_image_integrity_check_failed)
             write_recovery("Partition safe but low flash", recovery_option_partition_safe_but_clean_up_reccomended)
+            write_recovery("Failed to enter enable mode", recovery_option_enable_mode_failed)
 
             if not has_vulnerable_aps:
                 f.write("No recovery actions required.\n")
@@ -561,7 +598,7 @@ def analyze_logs(log_dir: str):
     add_rows(recovery_option_simple_archive_download, "Safe state but AP has buggy image in the backup partition")
     add_rows(recovery_option_image_integrity_check_failed, "Image integrity check has failed for these APs")
     add_rows(recovery_option_partition_safe_but_clean_up_reccomended, "Partition is safe but the flash storage is low")
-    
+    add_rows(recovery_option_enable_mode_failed, ENABLE_FAIL_MSG)
     print("DEBUG: analyze_logs running on:", log_dir)
 
     # ---------------- BUILD SUMMARY TEXT ----------------
@@ -591,6 +628,8 @@ def analyze_logs(log_dir: str):
             summary_lines.append(
                 f"{ap_name} ({ap_model}) [{ap_ip}] -> PARTITION SAFE BUT LOW FLASH"
             )
+    for ap_name, ap_model, ap_ip in recovery_option_enable_mode_failed:
+        summary_lines.append(f"{ap_name} ({ap_model}) [{ap_ip}] -> {ENABLE_FAIL_MSG}")
 
     summary_text = "\n".join(summary_lines)
     if not output_file:

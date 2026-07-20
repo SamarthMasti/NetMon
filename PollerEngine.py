@@ -419,6 +419,10 @@ class PollerEngine:
         self._log(f"[ENGINE] Using data directory: {self.data_dir}")
         self.success = 0
         self.failed = 0
+        # NEW: track APs where conn.enable() failed — used ONLY to flag them in the
+        # Susceptible/Vulnerable Table (AP Flash Checker). Does NOT affect AP Table.
+        self.enable_failed_aps = []
+        self._enable_fail_lock = threading.Lock()
         # Cooperative shutdown
         self._shutdown_event = threading.Event()
         # Executor reference (will be set when run_ap_poller creates it)
@@ -1151,7 +1155,25 @@ class PollerEngine:
             if conn is None:
                 return idx, ap.ip, ap.model, "Fail: Connection retries exhausted",ap.name,ap.wlc_ip
             self._open_sessions.append(conn)
-            conn.enable()
+            try:
+                conn.enable()
+            except Exception as _enable_exc:
+                # NEW: flag AP for the Susceptible Table only.
+                # We re-raise immediately after — the existing outer
+                # except Exception at the bottom of this method still
+                # handles the AP Table status exactly as it does today.
+                if "failed to enter enable mode" in str(_enable_exc).lower():
+                    with self._enable_fail_lock:
+                        self.enable_failed_aps.append({
+                            "name": ap.name,
+                            "model": ap.model,
+                            "ip": ap.ip,
+                        })
+                    self._log(
+                        f"[AP] {ap.ip} ({ap.name}) — enable mode failed, "
+                        f"flagged for Susceptible Table"
+                    )
+                raise
             # Disable paging; some APs use non-standard "more" prompts.
             try:
                 self._ap_send_command(conn, "terminal length 0", read_timeout=30)
