@@ -1382,6 +1382,30 @@ class PollerEngine:
                     sections.append(sec)
         return sorted(sections, key=lambda s: 0 if s == "WLC" else int(s[3:]))
 
+    def register_bulk_wlc_sections(self, bulk_list: list, user: str, pasw: str) -> list:
+        """
+        Bulk-upload (>3 WLC) mode only. Registers one synthetic, in-memory-only
+        section per WLC entry (name/ip pairs parsed from the uploaded Excel/
+        text file), all sharing the same username/password. Never written to
+        disk (no self.ini.save() call) and never collides with the section
+        names ("WLC", "WLC2", ...) the manual-entry path scans for, since
+        these section names never start with "WLC".
+
+        Returns the list of synthetic section names, in the same order as
+        bulk_list, ready to be used anywhere a manual WLC section name
+        (e.g. from _get_wlc_sections_list) is used today.
+        """
+        sections = []
+        for i, entry in enumerate(bulk_list):
+            section = f"BULKWLC{i}"
+            if not self.ini.cfg.has_section(section):
+                self.ini.cfg.add_section(section)
+            self.ini.set(section, "wlc_ip", entry.get("ip", ""))
+            self.ini.set(section, "wlc_user", user)
+            self.ini.set(section, "wlc_pasw", pasw)
+            sections.append(section)
+        return sections
+
     def _run_wlc_cmds_for_section(self, section: str, wlc_cmds: list) -> str:
         """Run WLC commands for a single named section. Same logic as run_wlc_cmds but single-section."""
         self._log(f"[WLC] ===== Starting section [{section}] =====")

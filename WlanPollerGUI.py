@@ -21,14 +21,15 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QTextEdit, QLineEdit,
     QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QCheckBox, QListWidget,
     QStackedWidget, QMessageBox, QGroupBox, QTableWidget, QTableWidgetItem,
-    QFileDialog, QSizePolicy, QSpacerItem, QFrame, QProgressBar, QFormLayout
+    QFileDialog, QSizePolicy, QSpacerItem, QFrame, QProgressBar, QFormLayout,
+    QRadioButton, QButtonGroup
 )
 from PollerEngine import PollerEngine
 from PollerEngine import decrypt_value, encrypt_value
 from PySide6.QtGui import QColor
 from PollerEngine import DATAPATH_MON_DEFAULT_ITERATIONS, DATAPATH_MON_DEFAULT_INTERVAL_SEC
 APP_NAME = "CISCO WLAN POLLER GUI"
-APP_VERSION = "v5.09"
+APP_VERSION = "v5.10"
 try:
     from ApFlashVulnerableChecker import analyze_logs
 except ImportError as e:
@@ -75,11 +76,12 @@ CONFIG_FILE = str(CONFD_DIR / "config.ini")
 CONFD = str(CONFD_DIR)
 # Optional Excel export
 try:
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font as XLFont, Alignment
     from openpyxl.utils import get_column_letter
 except Exception:
     Workbook = None
+    load_workbook = None
 
 # ---------------- Visual constants ----------------
 SIDEBAR_BG = "#000000"
@@ -161,6 +163,11 @@ def apply_global_style(app: QApplication):
 
     QPushButton:pressed {{
         background: #111111;
+    }}
+
+    QPushButton:disabled {{
+        background: #d1d5db;
+        color: #9ca3af;
     }}
 
 
@@ -334,6 +341,9 @@ class PollerWorker(QThread):
     ap_update = Signal(int, str, str, str, str,str)
     finished_ok = Signal(dict)
     failed = Signal(str)
+    # Bulk WLC mode only (>3 WLCs): reports (completed, total) WLC count as
+    # each WLC finishes. Never emitted for the manual (<=3 WLC) path.
+    wlc_progress = Signal(int, int)
 
     def _engine_progress(self, pct):
         self.progress_sig.emit(pct)
@@ -675,7 +685,19 @@ class PollerWorker(QThread):
                         self.finished_ok.emit(summary)
                         return
 
-                    wlc_sections = engine._get_wlc_sections_list()
+                    # Bulk WLC mode (>3 WLCs, uploaded via Excel/text): use the
+                    # uploaded list + shared credentials instead of config.ini
+                    # sections. Manual (<=3 WLC) runs are completely unaffected —
+                    # wlc_bulk_list stays empty for them and this branch is skipped.
+                    wlc_bulk_list = getattr(self, "wlc_bulk_list", None) or []
+                    if wlc_bulk_list:
+                        wlc_sections = engine.register_bulk_wlc_sections(
+                            wlc_bulk_list,
+                            getattr(self, "bulk_wlc_user", ""),
+                            getattr(self, "bulk_wlc_pasw", ""),
+                        )
+                    else:
+                        wlc_sections = engine._get_wlc_sections_list()
                     # ── Headless guard: verify ap_cmds are not empty before starting ──
                     if not self.ap_cmds and self.workflow != "AP Datapath Queue Mon":
                         raise ValueError(
@@ -754,7 +776,14 @@ class PollerWorker(QThread):
                         f"[WORKER] Starting {len(wlc_sections)} WLC(s) in parallel..."
                     )
 
-                    with ThreadPoolExecutor(max_workers=len(wlc_sections)) as wlc_executor:
+                    # Cap concurrent WLC connections at 10. For manual mode
+                    # (<=3 WLCs) this is a no-op — min(3, 10) == 3, identical
+                    # to the previous behavior. Only bulk mode (up to 50 WLCs)
+                    # is actually throttled by this.
+                    wlc_max_workers = min(len(wlc_sections), 10)
+                    wlc_done_count = 0
+
+                    with ThreadPoolExecutor(max_workers=wlc_max_workers) as wlc_executor:
                         wlc_futures = {
                             wlc_executor.submit(_process_one_wlc, sec): sec
                             for sec in wlc_sections
@@ -768,6 +797,12 @@ class PollerWorker(QThread):
                                     total_failed += f
                             except Exception as e:
                                 self.log.emit(f"[WORKER] {sec} failed: {e}")
+                            finally:
+                                if wlc_bulk_list:
+                                    with _count_lock:
+                                        wlc_done_count += 1
+                                        done_snapshot = wlc_done_count
+                                    self.wlc_progress.emit(done_snapshot, len(wlc_sections))
 
                     # ---- Write combined filtered list after all WLCs done ----
                     if all_filtered:
@@ -1478,6 +1513,26 @@ class MainWindow(QMainWindow):
         wlc_outer.setContentsMargins(0, 0, 0, 0)
         wlc_outer.setSpacing(6)
 
+        # 🔘 Configuration mode row (Manual vs. Bulk Upload) — own row, above the
+        # WLC Configurations header, so it reads as a mode switch rather than a
+        # toolbar toggle.
+        wlc_mode_row = QHBoxLayout()
+        wlc_mode_row.addWidget(QLabel("Configuration Mode:"))
+
+        self.wlc_mode_manual_radio = QRadioButton("Manual Entry (up to 3 WLC's)")
+        self.wlc_mode_bulk_radio = QRadioButton("Bulk Upload (up to 100 WLC's)")
+        self.wlc_mode_manual_radio.setChecked(True)
+
+        self.wlc_mode_group = QButtonGroup(self.wlc_block)
+        self.wlc_mode_group.addButton(self.wlc_mode_manual_radio)
+        self.wlc_mode_group.addButton(self.wlc_mode_bulk_radio)
+        self.wlc_mode_bulk_radio.toggled.connect(self._on_multi_wlc_toggle)
+
+        wlc_mode_row.addWidget(self.wlc_mode_manual_radio)
+        wlc_mode_row.addWidget(self.wlc_mode_bulk_radio)
+        wlc_mode_row.addStretch()
+        wlc_outer.addLayout(wlc_mode_row)
+
         wlc_header = QHBoxLayout()
         wlc_header.addWidget(QLabel("WLC Configurations"))
 
@@ -1496,11 +1551,54 @@ class MainWindow(QMainWindow):
         wlc_header.addWidget(self.btn_add_wlc)
         wlc_outer.addLayout(wlc_header)
 
+        # 📂 Bulk WLC list upload row (Excel) — shown only in Bulk Upload mode
+        self.wlc_bulk_upload_row = QWidget()
+        wb = QHBoxLayout(self.wlc_bulk_upload_row)
+        wb.setContentsMargins(0, 0, 0, 0)
+        wb.setSpacing(8)
+        wb.addWidget(QLabel("Upload WLC List (Excel: WLC IP, WLC Name)"))
+
+        self.wlc_bulk_path = QLineEdit()
+        self.wlc_bulk_path.setReadOnly(True)
+        wb.addWidget(self.wlc_bulk_path)
+
+        self.wlc_bulk_browse = QPushButton("Browse")
+        self.wlc_bulk_browse.setProperty("class", "secondary")
+        self.wlc_bulk_browse.clicked.connect(self._browse_wlc_list_excel)
+        wb.addWidget(self.wlc_bulk_browse)
+
+        self.wlc_bulk_upload_row.setVisible(False)
+        wlc_outer.addWidget(self.wlc_bulk_upload_row)
+
+        # Validation/status feedback for the uploaded file (mirrors ap_stats).
+        # Populated once the Excel parsing backend is wired up.
+        self.wlc_bulk_stats = QLabel("")
+        self.wlc_bulk_stats.setStyleSheet("color:#374151; font-weight:600; font-size:11px;")
+        self.wlc_bulk_stats.setVisible(False)
+        wlc_outer.addWidget(self.wlc_bulk_stats)
+
         self.wlc_entries_widget = QWidget()
         self.wlc_entries_layout = QVBoxLayout(self.wlc_entries_widget)
         self.wlc_entries_layout.setContentsMargins(0, 0, 0, 0)
         self.wlc_entries_layout.setSpacing(8)
         wlc_outer.addWidget(self.wlc_entries_widget)
+
+        # ℹ️ Guidance callout for bulk WLC mode — shown only in Bulk Upload mode
+        self.wlc_multi_note = QLabel(
+            "<b>⚠ All WLCs must use the same credentials.</b><br>"
+            "All WLC connections authenticate using the same username and password "
+            "entered here — confirm they are valid on every WLC before proceeding."
+            "<br><span style='font-size:10px;'>The uploaded file must be in Excel "
+            "format and list each WLC's IP address (required) and name (optional)."
+            "</span>"
+        )
+        self.wlc_multi_note.setWordWrap(True)
+        self.wlc_multi_note.setStyleSheet(
+            "background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; "
+            "color:#92400e; font-size:11px; padding:8px 10px;"
+        )
+        self.wlc_multi_note.setVisible(False)
+        wlc_outer.addWidget(self.wlc_multi_note)
 
         card_v.addWidget(self.wlc_block)
         self._add_wlc_entry()   # seed first entry
@@ -2110,6 +2208,14 @@ class MainWindow(QMainWindow):
             }
         """)
         lay.addWidget(self.progress)
+
+        # Bulk WLC mode only (>3 WLCs): "<done> / <total> WLCs completed"
+        # note under the progress bar. Hidden for the manual (<=3 WLC) path.
+        self.wlc_progress_label = QLabel("")
+        self.wlc_progress_label.setAlignment(Qt.AlignCenter)
+        self.wlc_progress_label.setStyleSheet("color:#374151; font-weight:600; font-size:11px; padding-top:2px;")
+        self.wlc_progress_label.setVisible(False)
+        lay.addWidget(self.wlc_progress_label)
 
         # ── AP TABLE ──────────────────────────────────────────
         self.ap_section = QWidget()
@@ -2871,6 +2977,7 @@ class MainWindow(QMainWindow):
                 ("vuln_table", lambda w: w.setRowCount(0)),
                 ("progress", lambda w: w.setValue(0)),
                 ("results_summary", lambda w: w.clear()),
+                ("wlc_progress_label", lambda w: (w.setText(""), w.setVisible(False))),
         ):
 
             if hasattr(self, attr):
@@ -2886,6 +2993,7 @@ class MainWindow(QMainWindow):
                 self.worker.ap_update.disconnect()
                 self.worker.finished_ok.disconnect()
                 self.worker.failed.disconnect()
+                self.worker.wlc_progress.disconnect()
             except Exception:
                 pass
             self.worker = None
@@ -2933,6 +3041,21 @@ class MainWindow(QMainWindow):
             self.worker.enable_reload = getattr(self, "enable_reload", False)
             self.worker.enable_debug_collection = getattr(self, "enable_debug_collection", False)
             self.worker.test_after_iteration = getattr(self, "test_after_iteration", False)
+
+            # Bulk WLC mode (>3 WLCs) — only active when the Bulk Upload radio
+            # is selected and a WLC list has been parsed from a file. Manual
+            # (<=3 WLC) runs always get an empty list here, so PollerWorker.run()
+            # falls back to its existing config.ini-based path unchanged.
+            if getattr(self, "wlc_mode_bulk_radio", None) and self.wlc_mode_bulk_radio.isChecked():
+                self.worker.wlc_bulk_list = getattr(self, "wlc_bulk_list", [])
+                self.worker.bulk_wlc_user = (
+                    self.wlc_entries[0]["user"].text().strip() if getattr(self, "wlc_entries", []) else ""
+                )
+                self.worker.bulk_wlc_pasw = (
+                    self.wlc_entries[0]["pasw"].text() if getattr(self, "wlc_entries", []) else ""
+                )
+            else:
+                self.worker.wlc_bulk_list = []
         except Exception as e:
             QMessageBox.critical(self, "Worker Error", f"Failed to create worker: {e}")
             return
@@ -2970,6 +3093,11 @@ class MainWindow(QMainWindow):
         try:
 
             self.worker.ap_update.connect(self._on_ap_update)
+        except Exception:
+            pass
+
+        try:
+            self.worker.wlc_progress.connect(self._on_wlc_progress)
         except Exception:
             pass
 
@@ -4915,6 +5043,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "progress"):
             self.progress.setValue(pct)
 
+    def _on_wlc_progress(self, done: int, total: int):
+        """Bulk WLC mode only (>3 WLCs) — updates the '<done> / <total> WLCs
+        completed' note under the progress bar. Never emitted for the manual
+        (<=3 WLC) path, so this never runs outside bulk-mode runs."""
+        if hasattr(self, "wlc_progress_label"):
+            self.wlc_progress_label.setText(f"{done} / {total} WLCs completed")
+            self.wlc_progress_label.setVisible(True)
+
     def changeEvent(self, event):
         from PySide6.QtCore import QEvent
 
@@ -4994,6 +5130,7 @@ class MainWindow(QMainWindow):
             pasw_field.setText(self.ini.get(section, "wlc_pasw"))
 
         form.addRow("IP:", ip_field)
+        ip_row_label = form.labelForField(ip_field)
         form.addRow("User:", user_field)
         form.addRow("Password:", pasw_field)
         entry_layout.addLayout(form)
@@ -5002,6 +5139,7 @@ class MainWindow(QMainWindow):
         self.wlc_entries.append({
             "widget": entry_widget,
             "ip": ip_field,
+            "ip_label": ip_row_label,
             "user": user_field,
             "pasw": pasw_field,
             "remove_btn": remove_btn,
@@ -5049,6 +5187,210 @@ class MainWindow(QMainWindow):
         if len(self.wlc_entries) > 1:
             entry = self.wlc_entries.pop()
             entry["widget"].setParent(None)
+            entry["widget"].deleteLater()
+
+            # Renumber labels and fix remove button visibility
+            for i, e in enumerate(self.wlc_entries):
+                lbl = e["widget"].findChild(QLabel)
+                if lbl:
+                    lbl.setText(f"WLC {i + 1}")
+                btn = e.get("remove_btn")
+                if btn:
+                    btn.setVisible(i > 0)
+
+            # Re-enable Add WLC button since we're below max
+            if hasattr(self, "btn_add_wlc"):
+                self.btn_add_wlc.setEnabled(len(self.wlc_entries) < 3)
+            if hasattr(self, "per_wlc_cmd_section"):
+                self._build_per_wlc_cmd_boxes()
+
+    def _on_multi_wlc_toggle(self, checked: bool):
+        """UI-only toggle for Bulk Upload mode (more than 3 WLCs). Disables the
+        manual Add/Remove WLC controls and swaps in the Excel-based WLC list
+        upload option instead. File parsing/validation is not wired up yet."""
+        # Switching back to Manual with a file already selected would silently
+        # discard it — confirm first, and stay in Bulk mode if the user backs out.
+        if not checked and getattr(self, "wlc_bulk_path", None) and self.wlc_bulk_path.text().strip():
+            reply = QMessageBox.question(
+                self, "Discard Uploaded WLC List?",
+                "Switching back to manual entry will discard the uploaded WLC list. Continue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                self.wlc_mode_bulk_radio.blockSignals(True)
+                self.wlc_mode_bulk_radio.setChecked(True)
+                self.wlc_mode_bulk_radio.blockSignals(False)
+                return
+            self.wlc_bulk_path.clear()
+            if hasattr(self, "wlc_bulk_stats"):
+                self.wlc_bulk_stats.setText("")
+                self.wlc_bulk_stats.setVisible(False)
+
+        self.btn_add_wlc.setEnabled(not checked)
+        self.remove_btn_wlc.setEnabled(not checked)
+
+        if hasattr(self, "wlc_bulk_upload_row"):
+            self.wlc_bulk_upload_row.setVisible(checked)
+        if hasattr(self, "wlc_multi_note"):
+            self.wlc_multi_note.setVisible(checked)
+
+        # Only WLC 1 remains visible — it now holds the shared credentials
+        for i, entry in enumerate(self.wlc_entries):
+            if i > 0:
+                entry["widget"].setVisible(not checked)
+
+        # WLC 1: relabel to make its new purpose explicit, and remove its IP
+        # field — the WLC list (with IPs) now comes from the uploaded file.
+        if self.wlc_entries:
+            wlc1 = self.wlc_entries[0]
+            lbl = wlc1["widget"].findChild(QLabel)
+            if lbl:
+                lbl.setText("Shared WLC Credentials" if checked else "WLC 1")
+            wlc1["ip"].setVisible(not checked)
+            if wlc1.get("ip_label"):
+                wlc1["ip_label"].setVisible(not checked)
+
+    def _browse_wlc_list_excel(self):
+        """File picker + parser for the bulk WLC list (Excel, or Text/CSV).
+
+        Supports two formats, auto-detected, columns in any order:
+          1) IP only     — a single column of WLC IP addresses
+          2) IP + Name    — two columns: WLC IP and WLC Name
+
+        Column identity is resolved from the header row when one is present
+        (a cell containing 'ip' / 'name'); otherwise it falls back to
+        inspecting the first data row and treating whichever cell parses as
+        a valid IPv4 address as the IP column, and any other non-empty cell
+        as the name column.
+
+        Excel files (.xlsx/.xls) are read via openpyxl. Text/CSV files
+        (.txt/.csv) are read as one entry per line, comma-or-whitespace
+        separated (same convention as the AP list upload).
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload WLC List File (Format: WLC IP, WLC Name)",
+            "",
+            "Excel/Text/CSV (*.xlsx *.xls *.txt *.csv);;Excel Files (*.xlsx *.xls);;"
+            "Text/CSV (*.txt *.csv);;All Files (*.*)"
+        )
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext in (".txt", ".csv"):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    rows = [
+                        [p.strip() for p in (line.split(",") if "," in line else line.split())]
+                        for line in f
+                        if line.strip()
+                    ]
+            except Exception as e:
+                QMessageBox.critical(self, "Invalid File", f"Could not read file:\n{e}")
+                return
+        else:
+            if load_workbook is None:
+                QMessageBox.critical(self, "Excel Support Missing",
+                                      "openpyxl is not available — cannot read Excel files.")
+                return
+            try:
+                wb = load_workbook(path, read_only=True, data_only=True)
+                ws = wb.active
+                rows = [
+                    [("" if c is None else str(c).strip()) for c in row]
+                    for row in ws.iter_rows(values_only=True)
+                ]
+                wb.close()
+            except Exception as e:
+                QMessageBox.critical(self, "Invalid File", f"Could not read Excel file:\n{e}")
+                return
+
+        rows = [r for r in rows if any(cell for cell in r)]
+        if not rows:
+            QMessageBox.critical(self, "Invalid File", "No data found in the file.")
+            return
+
+        def _is_ip(v: str) -> bool:
+            try:
+                socket.inet_pton(socket.AF_INET, v)
+                return True
+            except Exception:
+                return False
+
+        # ---- Detect header row & column positions ('ip' / 'name', any order) ----
+        ip_col, name_col = None, None
+        header_lower = [c.lower() for c in rows[0]]
+
+        if any("ip" in c for c in header_lower):
+            for i, c in enumerate(header_lower):
+                if "ip" in c and ip_col is None:
+                    ip_col = i
+                elif "name" in c and name_col is None:
+                    name_col = i
+            data_rows = rows[1:]
+        else:
+            # No header — infer columns from the first data row's content
+            data_rows = rows
+            for i, c in enumerate(rows[0]):
+                if _is_ip(c) and ip_col is None:
+                    ip_col = i
+                elif c and ip_col != i and name_col is None:
+                    name_col = i
+            if ip_col is None:
+                ip_col = 0  # fall back to first column as IP
+
+        total_cnt = valid_cnt = invalid_cnt = duplicate_cnt = 0
+        seen_ips = set()
+        parsed = []
+
+        for r in data_rows:
+            if not any(r):
+                continue
+            total_cnt += 1
+            ip = r[ip_col].strip() if ip_col < len(r) else ""
+            name = r[name_col].strip() if (name_col is not None and name_col < len(r)) else ""
+
+            if not _is_ip(ip):
+                invalid_cnt += 1
+                continue
+            if ip in seen_ips:
+                duplicate_cnt += 1
+                continue
+
+            seen_ips.add(ip)
+            valid_cnt += 1
+            parsed.append({"ip": ip, "name": name})
+
+        if valid_cnt == 0:
+            QMessageBox.critical(self, "Invalid File", "No valid WLC IP addresses found.")
+            return
+
+        self.wlc_bulk_path.setText(path)
+        # Parsed WLC list — consumed by the execution backend (to be wired up separately)
+        self.wlc_bulk_list = parsed
+
+        stats_html = f"""
+        <span style='color:#2563eb; font-weight:600;'>Total:</span> {total_cnt} |
+        <span style='color:#16a34a; font-weight:600;'>Valid:</span> {valid_cnt} |
+        <span style='color:#dc2626; font-weight:600;'>Invalid:</span> {invalid_cnt} |
+        <span style='color:#f59e0b; font-weight:600;'>Duplicates:</span> {duplicate_cnt}
+        """
+        if hasattr(self, "wlc_bulk_stats"):
+            self.wlc_bulk_stats.setText(stats_html)
+            self.wlc_bulk_stats.setVisible(True)
+
+        QMessageBox.information(
+            self, "WLC List Loaded",
+            f"""File loaded successfully.
+
+    Total rows: {total_cnt}
+    Valid WLCs: {valid_cnt}
+    Invalid entries: {invalid_cnt}
+    Duplicate IPs: {duplicate_cnt}
+    """
+        )
     def _update_workflow_dropdown(self):
 
         if not hasattr(self, "workflow_dd"):
