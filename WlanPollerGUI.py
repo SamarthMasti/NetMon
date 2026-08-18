@@ -475,11 +475,62 @@ class PollerWorker(QThread):
                         return
 
                     # OLD FLOW
-                    
+
                     if not self.wlc_cmds:
                         raise ValueError("WLC Cmd List is empty.")
 
-                    out = engine.run_wlc_cmds(self.wlc_cmds)
+                    wlc_bulk_list = getattr(self, "wlc_bulk_list", None) or []
+                    if wlc_bulk_list:
+                        # Bulk WLC mode (>3 WLCs): same pattern as the "WLC & AP"
+                        # bulk path — register synthetic sections from the
+                        # uploaded list, then run WLC commands across all of
+                        # them in parallel, capped at 10 concurrent. Manual
+                        # (<=3 WLC) "WLC Only" runs are unaffected — they still
+                        # fall through to engine.run_wlc_cmds() below unchanged.
+                        import threading
+                        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+                        wlc_sections = engine.register_bulk_wlc_sections(
+                            wlc_bulk_list,
+                            getattr(self, "bulk_wlc_user", ""),
+                            getattr(self, "bulk_wlc_pasw", ""),
+                        )
+                        self.log.emit(f"[WORKER] Bulk WLC Only: {len(wlc_sections)} WLC(s) found")
+
+                        wlc_max_workers = min(len(wlc_sections), 10)
+                        _out_lock = threading.Lock()
+                        _count_lock = threading.Lock()
+                        last_out_file = ""
+                        wlc_done_count = 0
+
+                        def _run_one_wlc_only(section):
+                            return engine._run_wlc_cmds_for_section(section, self.wlc_cmds)
+
+                        with ThreadPoolExecutor(max_workers=wlc_max_workers) as wlc_executor:
+                            wlc_futures = {
+                                wlc_executor.submit(_run_one_wlc_only, sec): sec
+                                for sec in wlc_sections
+                            }
+                            for fut in _as_completed(wlc_futures):
+                                sec = wlc_futures[fut]
+                                try:
+                                    out_file = fut.result()
+                                    if out_file:
+                                        with _out_lock:
+                                            last_out_file = out_file
+                                except Exception as e:
+                                    self.log.emit(f"[WORKER] {sec} failed: {e}")
+                                finally:
+                                    with _count_lock:
+                                        wlc_done_count += 1
+                                        done_snapshot = wlc_done_count
+                                    self.wlc_progress.emit(done_snapshot, len(wlc_sections))
+                                    self.progress.emit(int((done_snapshot / len(wlc_sections)) * 100))
+
+                        out = last_out_file
+                    else:
+                        out = engine.run_wlc_cmds(self.wlc_cmds)
+
                     summary.update({"wlc_output": out})
                     summary["end"] = datetime.now()
                     self.finished_ok.emit(summary)
@@ -803,6 +854,7 @@ class PollerWorker(QThread):
                                         wlc_done_count += 1
                                         done_snapshot = wlc_done_count
                                     self.wlc_progress.emit(done_snapshot, len(wlc_sections))
+                                    self.progress.emit(int((done_snapshot / len(wlc_sections)) * 100))
 
                     # ---- Write combined filtered list after all WLCs done ----
                     if all_filtered:
