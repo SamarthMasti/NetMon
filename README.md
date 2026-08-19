@@ -26,3 +26,14 @@ Enterprise-grade GUI tool for polling Cisco WLCs and Access Points using SSH aut
 ```bash
 pip install -r requirements.txt
 python WlanPollerGUI.py
+
+## Commands to build the executable
+
+```bash
+Windows : python -m PyInstaller --noconfirm --windowed --onefile --icon=assets/ciscologo.ico --add-data "assets;assets" WlanPollerGUI.py
+Macos : python -m PyInstaller \
+--onedir \
+--windowed \
+--icon=assets/ciscologo.icns \
+WlanPollerGUI.py
+
