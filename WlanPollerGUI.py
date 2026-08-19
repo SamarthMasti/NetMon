@@ -480,6 +480,11 @@ class PollerWorker(QThread):
                         raise ValueError("WLC Cmd List is empty.")
 
                     wlc_bulk_list = getattr(self, "wlc_bulk_list", None) or []
+                    if getattr(self, "bulk_mode_selected", False) and not wlc_bulk_list:
+                        raise ValueError(
+                            "Bulk Upload mode was selected but no WLC list is available. "
+                            "Go back to Step 2, click Browse, and select a WLC list file before starting."
+                        )
                     if wlc_bulk_list:
                         # Bulk WLC mode (>3 WLCs): same pattern as the "WLC & AP"
                         # bulk path — register synthetic sections from the
@@ -741,6 +746,11 @@ class PollerWorker(QThread):
                     # sections. Manual (<=3 WLC) runs are completely unaffected —
                     # wlc_bulk_list stays empty for them and this branch is skipped.
                     wlc_bulk_list = getattr(self, "wlc_bulk_list", None) or []
+                    if getattr(self, "bulk_mode_selected", False) and not wlc_bulk_list:
+                        raise ValueError(
+                            "Bulk Upload mode was selected but no WLC list is available. "
+                            "Go back to Step 2, click Browse, and select a WLC list file before starting."
+                        )
                     if wlc_bulk_list:
                         wlc_sections = engine.register_bulk_wlc_sections(
                             wlc_bulk_list,
@@ -2961,6 +2971,21 @@ class MainWindow(QMainWindow):
         Saves credentials silently, resets UI, builds the PollerWorker and starts it.
         """
         print('DbgWpgui: Inside Start_run..')
+
+        # Guard: Bulk Upload mode is selected but no WLC list file has actually
+        # been loaded this session — refuse to start rather than silently
+        # falling back to whatever manual WLC entry happens to be in config.ini.
+        if (self.operation_type in ("WLC Only", "WLC & AP")
+                and getattr(self, "wlc_mode_bulk_radio", None)
+                and self.wlc_mode_bulk_radio.isChecked()
+                and not getattr(self, "wlc_bulk_list", [])):
+            QMessageBox.critical(
+                self, "No WLC List Loaded",
+                "Bulk Upload mode is selected but no WLC list file has been loaded.\n\n"
+                "Go back to Step 2, click Browse, and select a WLC list file before starting."
+            )
+            return
+
         # 🔥 FORCE CORRECT TABLE STRUCTURE BEFORE RUN
 
         if self.operation_type == "AP Only":
@@ -3098,7 +3123,10 @@ class MainWindow(QMainWindow):
             # is selected and a WLC list has been parsed from a file. Manual
             # (<=3 WLC) runs always get an empty list here, so PollerWorker.run()
             # falls back to its existing config.ini-based path unchanged.
-            if getattr(self, "wlc_mode_bulk_radio", None) and self.wlc_mode_bulk_radio.isChecked():
+            self.worker.bulk_mode_selected = bool(
+                getattr(self, "wlc_mode_bulk_radio", None) and self.wlc_mode_bulk_radio.isChecked()
+            )
+            if self.worker.bulk_mode_selected:
                 self.worker.wlc_bulk_list = getattr(self, "wlc_bulk_list", [])
                 self.worker.bulk_wlc_user = (
                     self.wlc_entries[0]["user"].text().strip() if getattr(self, "wlc_entries", []) else ""
@@ -4103,9 +4131,17 @@ class MainWindow(QMainWindow):
             lines.append(f"Operation Type Selected in Step1: {summary.get('operation', '')}")
 
             if summary.get("operation") != "AP Only":
-                wlc_ip = self.wlc_entries[0]["ip"].text().strip() if getattr(self, "wlc_entries", []) else ""
-                if wlc_ip:
-                    lines.append(f"WLC IP address: {wlc_ip}")
+                is_bulk = bool(getattr(self, "wlc_mode_bulk_radio", None) and self.wlc_mode_bulk_radio.isChecked())
+                if is_bulk:
+                    bulk_count = len(getattr(self, "wlc_bulk_list", None) or [])
+                    bulk_file = os.path.basename(self.wlc_bulk_path.text().strip()) if hasattr(self, "wlc_bulk_path") else ""
+                    if bulk_count:
+                        source = f" from {bulk_file}" if bulk_file else ""
+                        lines.append(f"WLC Source: Bulk Upload — {bulk_count} WLC(s){source}")
+                else:
+                    wlc_ip = self.wlc_entries[0]["ip"].text().strip() if getattr(self, "wlc_entries", []) else ""
+                    if wlc_ip:
+                        lines.append(f"WLC IP address: {wlc_ip}")
 
             if summary.get("operation") in ("WLC & AP", "AP Only"):
                 lines.append(f"Total number of APs Processed: {summary.get('ap_total', 0)}")
@@ -5226,13 +5262,22 @@ class MainWindow(QMainWindow):
     def _validate_all_wlcs(self):
         missing = []
 
+        is_bulk = bool(getattr(self, "wlc_mode_bulk_radio", None) and self.wlc_mode_bulk_radio.isChecked())
+
         for idx, entry in enumerate(self.wlc_entries):
             ip = entry["ip"].text().strip()
             user = entry["user"].text().strip()
             pwd = entry["pasw"].text().strip()   # ✅ FIXED
 
-            if not ip or not user or not pwd:
-                missing.append(f"WLC {idx + 1}")
+            if is_bulk and idx == 0:
+                # Bulk mode: WLC1 holds the shared credentials only — its IP
+                # field is hidden and not required; WLC IPs come from the
+                # uploaded list file instead.
+                if not user or not pwd:
+                    missing.append(f"WLC {idx + 1}")
+            else:
+                if not ip or not user or not pwd:
+                    missing.append(f"WLC {idx + 1}")
 
         return missing
     def _remove_last_wlc_entry(self):
